@@ -311,20 +311,21 @@ export default function App() {
 
   useEffect(() => {
     fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId);
-    // Also trigger a silent live refresh 1.4s later so live upstream upload times sync immediately
+    // Also trigger a silent live refresh 800ms later so live upstream 1-min-ago uploads sync immediately
     const liveSyncTimer = window.setTimeout(() => {
       fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId, true, true);
-    }, 1400);
+    }, 800);
     return () => window.clearTimeout(liveSyncTimer);
   }, [currentCategory.path, currentPage, submittedSearch, activeNodeId, fetchCatalog]);
 
-  // Automatic Background Sync for New Movies & Episodes (Every 60s + App Foreground Wake)
+  // Automatic Real-Time Background Sync for New Movies & Episodes (Every 30s + App Foreground Wake)
   useEffect(() => {
     const interval = setInterval(() => {
       if (document.visibilityState === 'visible' && activeTab === 'browse') {
+        setLiveClockNow(Date.now());
         fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId, true, true);
       }
-    }, 60_000);
+    }, 30_000);
 
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && activeTab === 'browse') {

@@ -66,6 +66,7 @@ export interface MovieDetailData {
   title: string;
   url: string;
   poster: string;
+  backdrop?: string;
   qualityNote: string;
   typeBadge: string;
   language: string;

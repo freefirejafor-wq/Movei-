@@ -853,7 +853,7 @@ async function fetchOpenSubtitlesTracksForCandidates(
         };
       });
 
-      scored.sort((a, b) => b.score - a.score);
+      scored.sort((a: { score: number }, b: { score: number }) => b.score - a.score);
 
       const tracks: AvailableSubtitleTrack[] = [];
       const seenUrls = new Set<string>();
@@ -924,11 +924,8 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
 
   const streamHint = `${params.streamName || ''} ${params.title || ''}`;
 
-  // Run IMDb/OpenSubtitles lookup and Embedded MKV Stream Subtitle Probe in parallel!
-  const [candidates, embeddedProbeCues] = await Promise.all([
-    resolveImdbCandidates(searchTitle, isSeries),
-    fetchEmbeddedMkvSubtitles(params.streamUrl, 'probe', 0),
-  ]);
+  // 1. First resolve lightweight IMDb/OpenSubtitles JSON tracks (few KB) without downloading 5.7MB of the MKV stream!
+  const candidates = await resolveImdbCandidates(searchTitle, isSeries);
 
   const foundOnline = await fetchOpenSubtitlesTracksForCandidates(
     candidates,
@@ -943,28 +940,12 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
     for (let i = 0; i < foundOnline.tracks.length; i++) {
       try {
         const track = foundOnline.tracks[i];
-        let cues = await loadSubtitleTrackByUrl(track, params.currentTimeSec || 0);
+        const cues = await loadSubtitleTrackByUrl(track, params.currentTimeSec || 0);
         if (cues.length < minExpectedCues && foundOnline.tracks.length > i + 1) {
           continue;
         }
 
         if (cues.length >= 10) {
-          // If the .mkv file had embedded cues in the opening 6MB, cross-correlate to lock the exact millisecond offset!
-          let detectedOffsetSec = 0;
-          if (embeddedProbeCues.length >= 2) {
-            const exactOffset = computeExactOffsetFromEmbeddedCues(embeddedProbeCues, cues);
-            if (exactOffset !== null && Math.abs(exactOffset) >= 0.3) {
-              detectedOffsetSec = exactOffset;
-              cues = cues
-                .map((c) => ({
-                  ...c,
-                  startSec: Math.max(0, Number((c.startSec + exactOffset).toFixed(3))),
-                  endSec: Math.max(0.2, Number((c.endSec + exactOffset).toFixed(3))),
-                }))
-                .filter((c) => c.endSec > c.startSec);
-            }
-          }
-
           await ensureBanglaTranslationAroundTime(cues, params.currentTimeSec || 0);
 
           const vttText = buildVttFromCues(cues);
@@ -977,7 +958,7 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
             availableTracks: foundOnline.tracks,
             activeTrackIndex: i,
             matchedImdbId: foundOnline.matchedImdbId,
-            autoOffsetSec: detectedOffsetSec,
+            autoOffsetSec: 0,
           };
           subtitleMemoryCache.set(cacheKey, result);
           return result;
@@ -988,7 +969,8 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
     }
   }
 
-  // Fallback: If the movie is a brand-new/regional release not on OpenSubtitles, use the embedded MKV subtitle stream directly!
+  // 2. Fallback: Only probe embedded MKV subtitle stream if the movie is not found on OpenSubtitles!
+  const embeddedProbeCues = await fetchEmbeddedMkvSubtitles(params.streamUrl, 'probe', 0);
   if (embeddedProbeCues.length >= 2) {
     let allEmbedded = [...embeddedProbeCues];
     if ((params.currentTimeSec || 0) > 180) {

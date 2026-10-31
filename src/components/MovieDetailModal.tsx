@@ -58,6 +58,7 @@ import {
   universalApiFetch,
   warmStreamConnection,
 } from '../services/liveClientEngine';
+import Hls from 'hls.js';
 import { IosMkvStreamController } from '../services/mkvIosClientRemuxer';
 import {
   buildVttFromCues,
@@ -167,10 +168,10 @@ function pickBestSourceIndexForNet(sources: StreamSource[], autoNet: boolean): n
   }
   const isLightweightH264 = (s: StreamSource) =>
     s.type !== 'embed' &&
-    !/\b(hevc|h\.?265|x265|10bit)\b/i.test(`${s.name} ${s.qualityLabel}`) &&
+    !/\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${s.name} ${s.qualityLabel}`) &&
     !/best\s*quality/i.test(s.qualityLabel || '');
   const isAnyH264 = (s: StreamSource) =>
-    !/\b(hevc|h\.?265|x265|10bit)\b/i.test(`${s.name} ${s.qualityLabel}`);
+    !/\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${s.name} ${s.qualityLabel}`);
 
   if (!autoNet) {
     const firstH264 = sources.findIndex((s) => isLightweightH264(s));
@@ -209,7 +210,7 @@ function pickNextUpgradeSourceIndex(
 ): number {
   if (!sources || sources.length <= 1 || currentQuality >= maxTargetQuality) return -1;
   const isLightweightH264 = (s: StreamSource) =>
-    !/\b(hevc|h\.?265|x265|10bit)\b/i.test(`${s.name} ${s.qualityLabel}`) &&
+    !/\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${s.name} ${s.qualityLabel}`) &&
     !/best\s*quality/i.test(s.qualityLabel || '') &&
     s.type !== 'embed';
 
@@ -350,12 +351,15 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const [playerMode, setPlayerMode] = useState<'stream' | 'trailer'>('stream');
   const [videoError, setVideoError] = useState(false);
+  // Use continuous native <video> streaming on Chrome/Android/Desktop (zero segment reloads!)
+  // and Turbo Micro-Chunk MP4 Remuxer on iPhone/iPad/Safari (with fallback if native fails)
   const [useHlsBridge, setUseHlsBridge] = useState<boolean>(() => isAppleWebKitDevice());
   const [iosBlobUrl, setIosBlobUrl] = useState<string>('');
   const [iosSegmentStartSec, setIosSegmentStartSec] = useState<number>(0);
   const [iosCurrentSegIndex, setIosCurrentSegIndex] = useState<number>(0);
   const iosControllerRef = useRef<IosMkvStreamController | null>(null);
   const iosTransitioningRef = useRef<boolean>(false);
+  const hlsInstanceRef = useRef<Hls | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [hasStartedPlayback, setHasStartedPlayback] = useState(false);
@@ -699,7 +703,51 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     if (instantCached && instantCached.episodes && instantCached.episodes.length > 0) {
       setLoading(false);
       applyResolvedDetail(instantCached, detail === instantCached);
-      return;
+      // Background non-blocking enrich after 2.5s: APPEND any newly discovered servers to the END
+      // of the sources list so `sources[selectedSourceIdx]` NEVER changes URL mid-playback!
+      const enrichTimer = window.setTimeout(() => {
+        if (cancelled) return;
+        const params = new URLSearchParams({
+          path: movie.path || movie.url,
+          title: movie.title,
+          node: activeNodeId,
+          enrich: '1',
+        });
+        universalApiFetch(`/api/details?${params.toString()}`)
+          .then((data) => {
+            if (!cancelled && data?.ok && data?.detail?.episodes?.length) {
+              setDetail((prev) => {
+                if (!prev || !prev.episodes?.length) return data.detail;
+                let addedAny = false;
+                const mergedEpisodes = prev.episodes.map((ep, idx) => {
+                  const incomingEp = data.detail.episodes?.[idx];
+                  if (!incomingEp?.sources?.length) return ep;
+                  const existingUrls = new Set((ep.sources || []).map((s) => s.url));
+                  const extraSources = incomingEp.sources.filter(
+                    (s: StreamSource) => s.url && !existingUrls.has(s.url)
+                  );
+                  if (extraSources.length === 0) return ep;
+                  addedAny = true;
+                  return {
+                    ...ep,
+                    sources: [...(ep.sources || []), ...extraSources],
+                  };
+                });
+                if (data.detail.episodes.length > prev.episodes.length) {
+                  const newEpisodes = data.detail.episodes.slice(prev.episodes.length);
+                  mergedEpisodes.push(...newEpisodes);
+                  addedAny = true;
+                }
+                return addedAny ? { ...prev, episodes: mergedEpisodes } : prev;
+              });
+            }
+          })
+          .catch(() => {});
+      }, 2500);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(enrichTimer);
+      };
     }
 
     setLoading(true);
@@ -796,42 +844,68 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     return episodeSortOrder === 'desc' ? [...matched].reverse() : matched;
   }, [episodes, selectedSeasonFilter, episodeSearchQuery, episodeSortOrder]);
 
-  // Automatic Synchronized Bangla Subtitle Resolver — Waits until video playback has started
-  // (or embed mode) so 100% of mobile bandwidth goes to starting the video in <1s!
+  // Automatic Synchronized Bangla Subtitle Resolver — Waits 1.2s after video playback has started
+  // so 100% of bandwidth goes to starting the video & prebuffering segment #1 first!
   useEffect(() => {
     if (!movie || !autoBanglaSubEnabled) return;
     if (!hasStartedPlayback && !isEmbedSource) return;
     let cancelled = false;
-    setLoadingAutoSub(true);
 
-    fetchOrGenerateAutoBanglaSubtitles({
-      moviePath: movie.path || movie.url,
-      title: detail?.title || movie.title,
-      storyline: detail?.storyline || '',
-      episodeLabel: activeEpisode?.label || '',
-      season: activeEpisode?.season,
-      episode: activeEpisode?.number,
-      language: detail?.language || movie.language,
-      streamUrl: activeSource?.url,
-      streamName: `${activeSource?.name || ''} ${activeSource?.qualityLabel || ''} ${detail?.quality || movie.quality || ''}`,
-      videoDurationSec: duration || undefined,
-      currentTimeSec: Math.max(0, currentTime - subOffsetSec),
-    })
-      .then((res) => {
-        if (cancelled) return;
-        setSubtitleCues(res.cues);
-        setSubtitleUrl(res.vttBlobUrl);
-        setSubtitleName(res.sourceLabel);
-        setAvailableSubTracks(res.availableTracks || []);
-        setActiveSubTrackIdx(res.activeTrackIndex || 0);
+    const subDelayTimer = window.setTimeout(() => {
+      if (cancelled) return;
+
+      // Fast-path: check if our Micro-Chunk MKV remuxer already extracted embedded subtitles from RAM!
+      const inMemoryMkvSubs = iosControllerRef.current?.getExtractedSubtitles() || [];
+      if (inMemoryMkvSubs.length >= 8) {
+        const mappedCues: SubtitleCue[] = inMemoryMkvSubs.map((s) => ({
+          startSec: s.ptsMs / 1000,
+          endSec: s.endPtsMs / 1000,
+          text: s.text,
+        }));
+        ensureBanglaTranslationAroundTime(mappedCues, Math.max(0, currentTime - subOffsetSec))
+          .then(() => {
+            if (cancelled) return;
+            const vttText = buildVttFromCues(mappedCues);
+            const blob = new Blob([vttText], { type: 'text/vtt' });
+            setSubtitleCues(mappedCues);
+            setSubtitleUrl(URL.createObjectURL(blob));
+            setSubtitleName('বাংলা Sub (Embedded Sync)');
+          })
+          .catch(() => {});
+        return;
+      }
+
+      setLoadingAutoSub(true);
+      fetchOrGenerateAutoBanglaSubtitles({
+        moviePath: movie.path || movie.url,
+        title: detail?.title || movie.title,
+        storyline: detail?.storyline || '',
+        episodeLabel: activeEpisode?.label || '',
+        season: activeEpisode?.season,
+        episode: activeEpisode?.number,
+        language: detail?.language || movie.language,
+        streamUrl: activeSource?.url,
+        streamName: `${activeSource?.name || ''} ${activeSource?.qualityLabel || ''} ${detail?.quality || movie.quality || ''}`,
+        videoDurationSec: duration || undefined,
+        currentTimeSec: Math.max(0, currentTime - subOffsetSec),
       })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) setLoadingAutoSub(false);
-      });
+        .then((res) => {
+          if (cancelled) return;
+          setSubtitleCues(res.cues);
+          setSubtitleUrl(res.vttBlobUrl);
+          setSubtitleName(res.sourceLabel);
+          setAvailableSubTracks(res.availableTracks || []);
+          setActiveSubTrackIdx(res.activeTrackIndex || 0);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setLoadingAutoSub(false);
+        });
+    }, 1200);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(subDelayTimer);
     };
   }, [
     movie?.path,
@@ -906,7 +980,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     currentTime,
   ]);
 
-  // Client-Side In-Browser MKV-to-MP4 Remuxer Engine for iPhone / iPad / Safari
+  // Client-Side In-Browser Turbo Micro-Chunk MKV-to-MP4 Engine (700KB Instant Start + 650KB Exact Cues Seek)
   useEffect(() => {
     const rawUrl = activeSource?.url || '';
     const isAlreadyNativeMp4 = /\.(mp4|m4v|m3u8)(\?|$)/i.test(rawUrl);
@@ -927,7 +1001,26 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       iosControllerRef.current = null;
     }
 
-    const ctrl = new IosMkvStreamController(rawUrl, introSkipSec);
+    // Compute any initial resume timestamp BEFORE starting the controller so it jumps straight
+    // to the resumed CuePoint in a single 700KB fetch instead of fetching 0s first!
+    const initialResumeTarget =
+      pendingResumeSecRef.current && pendingResumeSecRef.current > 15
+        ? pendingResumeSecRef.current
+        : !hasAppliedIntroSkipRef.current &&
+            savedProgress &&
+            (savedProgress.episodeIdx === undefined ||
+              savedProgress.episodeIdx === selectedEpIdx) &&
+            savedProgress.progressSeconds &&
+            savedProgress.progressSeconds > 20
+          ? savedProgress.progressSeconds
+          : 0;
+
+    if (initialResumeTarget > 15) {
+      pendingResumeSecRef.current = null;
+      hasAppliedIntroSkipRef.current = true;
+    }
+
+    const ctrl = new IosMkvStreamController(rawUrl, introSkipSec, initialResumeTarget);
     iosControllerRef.current = ctrl;
     iosTransitioningRef.current = false;
     setIosBlobUrl('');
@@ -945,54 +1038,30 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           setDuration(Math.floor(totalDur));
         }
 
-        // Check if we have a pending resume timestamp or saved watch progress beyond seg0
-        const targetResume =
-          pendingResumeSecRef.current && pendingResumeSecRef.current > 15
-            ? pendingResumeSecRef.current
-            : !hasAppliedIntroSkipRef.current &&
-                savedProgress &&
-                (savedProgress.episodeIdx === undefined ||
-                  savedProgress.episodeIdx === selectedEpIdx) &&
-                savedProgress.progressSeconds &&
-                savedProgress.progressSeconds > 20
-              ? savedProgress.progressSeconds
-              : null;
-
-        if (
-          targetResume !== null &&
-          targetResume > seg0.startSec + seg0.durationSec - 2 &&
-          totalDur > 0 &&
-          targetResume < totalDur - 20
-        ) {
-          pendingResumeSecRef.current = null;
-          hasAppliedIntroSkipRef.current = true;
-          const seekSeg = await ctrl.seekToSeconds(targetResume);
-          if (iosControllerRef.current !== ctrl) return;
-          if (seekSeg) {
-            setIosCurrentSegIndex(seekSeg.index);
-            setIosSegmentStartSec(seekSeg.startSec);
-            setIosBlobUrl(seekSeg.blobUrl);
-            setCurrentTime(Math.floor(seekSeg.startSec));
-            setResumedBannerSec(Math.floor(seekSeg.startSec));
-            setIsBuffering(false);
-            return;
-          }
-        }
-
         setIosCurrentSegIndex(seg0.index);
         setIosSegmentStartSec(seg0.startSec);
         setIosBlobUrl(seg0.blobUrl);
         setCurrentTime(Math.floor(seg0.startSec));
+        if (initialResumeTarget > 20 && seg0.startSec >= 18) {
+          setResumedBannerSec(Math.floor(seg0.startSec));
+        }
         setIsBuffering(false);
       })
       .catch(() => {
         if (iosControllerRef.current !== ctrl) return;
-        // Try next available stream source if current source fails
+        // Try next available H.264 stream source if current source fails
         const nextFailed = Array.from(new Set([...failedSourceIndices, selectedSourceIdx]));
         setFailedSourceIndices(nextFailed);
         const nextCandidateIdx = sources.findIndex((_, idx) => !nextFailed.includes(idx));
         if (nextCandidateIdx !== -1) {
           setSelectedSourceIdx(nextCandidateIdx);
+          return;
+        }
+        // If all sources are AV1/HEVC and device is Chrome/Android (non-WebKit), fall back to native <video> MKV playback!
+        if (!isAppleWebKitDevice()) {
+          setUseHlsBridge(false);
+          setFailedSourceIndices([]);
+          setSelectedSourceIdx(0);
           return;
         }
         setIsBuffering(false);
@@ -1031,19 +1100,38 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
     const v = videoRef.current;
     if (v && !isEmbedSource) {
-      syncCleanAudioVolume(v);
-      const p = v.play();
-      if (p !== undefined) {
-        p.catch((err: any) => {
-          // Only fall back to muted play if the browser explicitly blocked unmuted autoplay (NotAllowedError),
-          // NOT on AbortError when the stream is simply loading!
-          if (err && err.name === 'NotAllowedError') {
-            v.muted = true;
-            setIsMuted(true);
-            setAutoMutedForiOS(true);
-            v.play().catch(() => {});
-          }
+      if (hlsInstanceRef.current) {
+        hlsInstanceRef.current.destroy();
+        hlsInstanceRef.current = null;
+      }
+      const isM3u8 = /\.m3u8(\?|$)/i.test(effectiveVideoUrl);
+      if (isM3u8 && Hls.isSupported() && !v.canPlayType('application/vnd.apple.mpegurl')) {
+        const hls = new Hls({
+          enableWorker: true,
+          maxBufferLength: 20,
+          maxMaxBufferLength: 40,
+          startFragPrefetch: true,
         });
+        hlsInstanceRef.current = hls;
+        hls.loadSource(effectiveVideoUrl);
+        hls.attachMedia(v);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          syncCleanAudioVolume(v);
+          v.play().catch(() => {});
+        });
+      } else {
+        syncCleanAudioVolume(v);
+        const p = v.play();
+        if (p !== undefined) {
+          p.catch((err: any) => {
+            if (err && err.name === 'NotAllowedError') {
+              v.muted = true;
+              setIsMuted(true);
+              setAutoMutedForiOS(true);
+              v.play().catch(() => {});
+            }
+          });
+        }
       }
     }
 
@@ -1054,7 +1142,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       }
     }, 600);
 
-    return () => window.clearTimeout(bufTimer);
+    return () => {
+      window.clearTimeout(bufTimer);
+      if (hlsInstanceRef.current) {
+        hlsInstanceRef.current.destroy();
+        hlsInstanceRef.current = null;
+      }
+    };
   }, [effectiveVideoUrl, useHlsBridge, isEmbedSource]);
 
   useEffect(() => {
@@ -1353,6 +1447,23 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       return;
     }
 
+    // 3. Skip the 12s upstream voice-tag intro on Frame 0 before playback starts so it never plays or jumps later!
+    if (
+      !hasAppliedIntroSkipRef.current &&
+      introSkipSec > 0 &&
+      (!v.duration || v.duration > introSkipSec + 30) &&
+      v.currentTime < introSkipSec - 1
+    ) {
+      hasAppliedIntroSkipRef.current = true;
+      try {
+        v.currentTime = introSkipSec;
+        setCurrentTime(introSkipSec);
+      } catch {
+        // ignore
+      }
+    }
+
+    syncCleanAudioVolume(v);
     startVideoWithiOSFallback(v);
   };
 
@@ -2009,6 +2120,10 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const { targetSec, percent } = computeScrubberTarget(clientX, clientY, el);
     setScrubPreview({ sec: targetSec, percent });
     setCurrentTime(targetSec);
+    // Pre-fetch the 650KB Matroska Cluster at the hovered/dragged timestamp BEFORE the user releases their finger!
+    if (useHlsBridge && iosControllerRef.current) {
+      iosControllerRef.current.prewarmSeekTarget(targetSec);
+    }
     return targetSec;
   };
 
@@ -2437,6 +2552,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   setHasStartedPlayback(true);
                   setIsBuffering(false);
                   syncCleanAudioVolume(e.currentTarget);
+                  if (useHlsBridge && e.currentTarget.paused && e.currentTarget.currentTime < 0.5) {
+                    startVideoWithiOSFallback(e.currentTarget);
+                  }
                 }}
                 onCanPlayThrough={(e) => {
                   setHasStartedPlayback(true);
@@ -2492,7 +2610,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     useHlsBridge &&
                     iosControllerRef.current &&
                     segDur > 0 &&
-                    segDur - v.currentTime < 14
+                    segDur - v.currentTime < 24
                   ) {
                     iosControllerRef.current.ensureNextSegmentPrebuffered(
                       iosCurrentSegIndex + 1
@@ -2900,6 +3018,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     e.currentTarget
                   );
                   setScrubPreview({ sec: targetSec, percent });
+                  if (useHlsBridge && iosControllerRef.current) {
+                    iosControllerRef.current.prewarmSeekTarget(targetSec);
+                  }
                 }}
                 onMouseLeave={() => setScrubPreview(null)}
                 onTouchStart={(e) => {

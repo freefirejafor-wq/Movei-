@@ -26,6 +26,14 @@ import type {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (kept server alive):', err?.message || err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (kept server alive):', reason);
+});
+
 interface MirrorNodeConfig {
   id: string;
   name: string;
@@ -234,11 +242,16 @@ function parseMovieCards(html: string): { items: MovieCardItem[]; maxPage: numbe
     const rawHref = hrefMatch[1].trim();
     if (!rawHref || rawHref.includes("'+") || rawHref === '#') continue;
 
-    const itemPath = rawHref.startsWith('http')
-      ? new URL(rawHref).pathname
-      : rawHref.startsWith('/')
-        ? rawHref
-        : `/${rawHref}`;
+    let itemPath = '';
+    try {
+      itemPath = rawHref.startsWith('http')
+        ? new URL(rawHref).pathname
+        : rawHref.startsWith('/')
+          ? rawHref
+          : `/${rawHref}`;
+    } catch {
+      continue;
+    }
 
     if (seenPaths.has(itemPath)) continue;
     seenPaths.add(itemPath);
@@ -866,7 +879,7 @@ function parseMyFlixDetail(html: string, itemPath: string): MovieDetailData {
   const episodes: EpisodeItem[] = [];
 
   // 1. Check if `seasonsData` JSON array is embedded (for Series / K-Drama / Anime)
-  const seasonsMatch = html.match(/const\s+seasonsData\s*=\s*(\[[\s\S]*?\]);/);
+  const seasonsMatch = html.match(/(?:const|let|var)\s+seasonsData\s*=\s*(\[\s*\{[\s\S]*?\}\s*\])\s*;?/);
   if (seasonsMatch) {
     try {
       const parsedSeasons = JSON.parse(seasonsMatch[1]);
@@ -1008,42 +1021,46 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Preload static-db.json into RAM on server startup so 140+ top movies & 58 categories respond in < 1ms!
-  try {
-    const staticDbPath = path.join(__dirname, 'public', 'static-db.json');
-    if (fs.existsSync(staticDbPath)) {
-      const parsed = JSON.parse(fs.readFileSync(staticDbPath, 'utf8'));
-      const catalogTtl = Date.now() + 45_000;
-      const detailTtl = Date.now() + 3600_000 * 6;
-      if (parsed?.catalogs) {
-        for (const [catPath, items] of Object.entries(parsed.catalogs)) {
-          if (Array.isArray(items) && items.length > 0) {
-            const normItems = normalizeMovieCardList(items as MovieCardItem[]);
-            catalogCache.set(`${catPath}::page=1::q=::node=auto`, {
-              data: { items: normItems, maxPage: 520, activeNodeId: 'node-alpha' },
-              expiresAt: catalogTtl,
-            });
-            catalogCache.set(`${catPath}::page=1::q=::node=node-alpha`, {
-              data: { items: normItems, maxPage: 520, activeNodeId: 'node-alpha' },
-              expiresAt: catalogTtl,
-            });
+  // Preload static-db.json into RAM asynchronously after startup so server binds port 3000 immediately
+  const preloadStaticDb = async () => {
+    try {
+      const staticDbPath = path.join(__dirname, 'public', 'static-db.json');
+      if (fs.existsSync(staticDbPath)) {
+        const rawJson = await fs.promises.readFile(staticDbPath, 'utf8');
+        const parsed = JSON.parse(rawJson);
+        const catalogTtl = Date.now() + 45_000;
+        const detailTtl = Date.now() + 3600_000 * 6;
+        if (parsed?.catalogs) {
+          for (const [catPath, items] of Object.entries(parsed.catalogs)) {
+            if (Array.isArray(items) && items.length > 0) {
+              const normItems = normalizeMovieCardList(items as MovieCardItem[]);
+              catalogCache.set(`${catPath}::page=1::q=::node=auto`, {
+                data: { items: normItems, maxPage: 520, activeNodeId: 'node-alpha' },
+                expiresAt: catalogTtl,
+              });
+              catalogCache.set(`${catPath}::page=1::q=::node=node-alpha`, {
+                data: { items: normItems, maxPage: 520, activeNodeId: 'node-alpha' },
+                expiresAt: catalogTtl,
+              });
+            }
+          }
+        }
+        if (parsed?.details) {
+          for (const [itemPath, det] of Object.entries(parsed.details)) {
+            if (det && typeof det === 'object') {
+              detailCache.set(itemPath, {
+                data: det as MovieDetailData,
+                expiresAt: detailTtl,
+              });
+            }
           }
         }
       }
-      if (parsed?.details) {
-        for (const [itemPath, det] of Object.entries(parsed.details)) {
-          if (det && typeof det === 'object') {
-            detailCache.set(itemPath, {
-              data: det as MovieDetailData,
-              expiresAt: detailTtl,
-            });
-          }
-        }
-      }
+    } catch {
+      // ignore preload errors
     }
-  } catch {
-    // ignore preload errors
-  }
+  };
+  setTimeout(preloadStaticDb, 100);
 
   // Pre-warm & auto-sync main catalog categories in background (merging primary nodes + myflixbd.to!)
   const syncLiveCategories = async () => {
@@ -1083,20 +1100,21 @@ async function startServer() {
           catalogCache.set(cacheKey, entry);
           catalogCache.set(`${wp}::page=1::q=::node=${activeNodeId}`, entry);
 
-          // Pre-warm uncached top details in background so clicking any newly synced movie is a 0ms cache hit!
-          for (const card of mergedItems.slice(0, 8)) {
+          // Gently pre-warm top 3 uncached details per category
+          for (const card of mergedItems.slice(0, 3)) {
             if (!card.path || card.path.startsWith('/mf/') || detailCache.has(card.path)) continue;
-            fetchFromMirrors(card.path, activeNodeId)
-              .then(({ html, finalOrigin }) => {
-                const det = parseMovieDetail(html, card.path, finalOrigin);
-                if (det.episodes.length > 0) {
-                  detailCache.set(card.path, {
-                    data: det,
-                    expiresAt: Date.now() + 3600_000,
-                  });
-                }
-              })
-              .catch(() => {});
+            try {
+              const { html, finalOrigin } = await fetchFromMirrors(card.path, activeNodeId);
+              const det = parseMovieDetail(html, card.path, finalOrigin);
+              if (det.episodes.length > 0) {
+                detailCache.set(card.path, {
+                  data: det,
+                  expiresAt: Date.now() + 3600_000,
+                });
+              }
+            } catch {
+              // ignore single detail warmup failure
+            }
           }
         }
       } catch {
@@ -1104,8 +1122,8 @@ async function startServer() {
       }
     }
   };
-  setTimeout(syncLiveCategories, 1500);
-  setInterval(syncLiveCategories, 180_000);
+  setTimeout(syncLiveCategories, 12_000).unref();
+  setInterval(syncLiveCategories, 180_000).unref();
 
   // 1. Categories & Anonymized Server Nodes Endpoint
   app.get('/api/categories', (_req, res) => {
@@ -1319,7 +1337,7 @@ async function startServer() {
       if (items.length > 0) {
         catalogCache.set(cacheKey, {
           data: { items, maxPage, activeNodeId },
-          expiresAt: Date.now() + 120_000,
+          expiresAt: Date.now() + 30_000,
         });
         res.json({
           ok: true,
@@ -1389,15 +1407,23 @@ async function startServer() {
       return detailObj;
     };
 
+    const isEnrich = req.query.enrich === '1';
+    const hasTurboHlsSource = (d: MovieDetailData) =>
+      Boolean(
+        d.episodes?.some((ep) =>
+          ep.sources?.some((s) => s.id.startsWith('mf-') || /abyssplayer\.com|\.m3u8/i.test(s.url))
+        )
+      );
+
     // 1. Instant 0ms check by path
     const cached = detailCache.get(rawPath);
-    if (cached && cached.expiresAt > Date.now()) {
+    if (cached && cached.expiresAt > Date.now() && (!isEnrich || hasTurboHlsSource(cached.data))) {
       res.json({ ok: true, cached: true, detail: attachFastRelatedSeasons(cached.data) });
       return;
     }
 
     // 2. Instant 0ms check by matching title in detailCache
-    if (fallbackTitle && !rawPath.startsWith('/mf/')) {
+    if (fallbackTitle && !rawPath.startsWith('/mf/') && !isEnrich) {
       const cleanWant = extractBaseSeriesTitle(fallbackTitle).toLowerCase();
       for (const entry of detailCache.values()) {
         const d = entry.data;
