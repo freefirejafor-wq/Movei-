@@ -1362,6 +1362,102 @@ export class IosMkvStreamController {
 
   public async startInitialSegment(): Promise<RemuxedSegmentItem> {
     this.lastEmittedVideoPtsMs = -1;
+    const isResumeJump = this.initialResumeSec > 15;
+
+    // ULTRA-FAST 1-REQUEST STARTUP (~240ms):
+    // When starting from the beginning (0:00), fetch the first 600 KB (header + Tracks + Cluster #0)
+    // in a SINGLE HTTP Range request instead of 3 sequential requests!
+    if (!isResumeJump) {
+      const SINGLE_SHOT_BYTES = 600 * 1024;
+      const res = await fetch(this.url, {
+        signal: this.abortController.signal,
+        headers: {
+          Range: `bytes=0-${SINGLE_SHOT_BYTES - 1}`,
+        },
+      });
+      if (!res.ok && res.status !== 206) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const contentRange = res.headers.get('content-range') || '';
+      const totalMatch = contentRange.match(/\/(\d+)/);
+      if (totalMatch) {
+        this.totalFileBytes = Number(totalMatch[1]);
+      }
+      const buf = new Uint8Array(await res.arrayBuffer());
+      if (this.aborted) throw new Error('Aborted');
+
+      const parsed = parseMkvHeaderAndSamples(buf);
+      if (parsed.tracks.length > 0) this.tracks = parsed.tracks;
+      this.timecodeScale = parsed.timecodeScale;
+      this.segmentDataOffset = parsed.segmentDataOffset || 52;
+      this.cuesByteOffset = parsed.cuesByteOffset;
+      if (parsed.durationSec > 0) {
+        this.totalDurationSec = parsed.durationSec;
+      }
+      this.mergeSubtitleSamples(parsed.subtitleSamples);
+
+      const existingMeta = mkvStreamMetaCache.get(this.url);
+      if (existingMeta && existingMeta.cuePoints.length > 0) {
+        this.cuePoints = existingMeta.cuePoints;
+      } else {
+        mkvStreamMetaCache.set(this.url, {
+          tracks: this.tracks,
+          timecodeScale: this.timecodeScale,
+          totalDurationSec: this.totalDurationSec,
+          totalFileBytes: this.totalFileBytes,
+          segmentDataOffset: this.segmentDataOffset,
+          firstClusterOffset: parsed.firstClusterOffset > 0 ? parsed.firstClusterOffset : 1500,
+          cuesByteOffset: this.cuesByteOffset,
+          cuePoints: [],
+        });
+        // Load Cues keyframe index in the background immediately so seeking is 0-wait ready!
+        this.ensureCuesTableLoaded();
+      }
+
+      const primaryVTrack = this.tracks.find((t) => t.type === 1);
+      if (
+        primaryVTrack &&
+        /AV1/i.test(primaryVTrack.codecId) &&
+        typeof document !== 'undefined'
+      ) {
+        const canPlayAv1 = document
+          .createElement('video')
+          .canPlayType('video/mp4; codecs="av01.0.05M.08"');
+        if (!canPlayAv1) {
+          throw new Error('AV1 codec unsupported on this iOS device; switching to H.264');
+        }
+      }
+
+      if (parsed.videoSamples.length >= 2) {
+        const endedAtCompleteCluster =
+          parsed.consumedBytes > 0 && parsed.consumedBytes < buf.byteLength;
+        this.nextByteOffset =
+          parsed.consumedBytes > 0 ? parsed.consumedBytes : buf.byteLength;
+        if (this.totalFileBytes > 0 && this.nextByteOffset >= this.totalFileBytes) {
+          this.eofReached = true;
+        }
+        const seg0 = this.finalizeSegmentFromSamples(
+          0,
+          parsed.videoSamples,
+          parsed.audioSamples,
+          endedAtCompleteCluster
+        );
+        if (seg0) {
+          this.segments.push(seg0);
+          if (this.cuePoints.length > 0) {
+            this.ensureNextSegmentPrebuffered(1);
+          } else {
+            this.ensureCuesTableLoaded().finally(() => {
+              if (!this.aborted && this.segments.length === 1) {
+                this.ensureNextSegmentPrebuffered(1);
+              }
+            });
+          }
+          return seg0;
+        }
+      }
+    }
+
     let meta = mkvStreamMetaCache.get(this.url);
     if (!meta || meta.tracks.length === 0) {
       const HEADER_PROBE_BYTES = 16 * 1024;
@@ -1427,8 +1523,6 @@ export class IosMkvStreamController {
       }
     }
 
-    // Wait up to 2200ms for the ~45KB Cues table so we ALWAYS jump straight to the exact 12s Cluster
-    // and have the full keyframe seek table ready for instant seeking!
     if (this.cuePoints.length === 0 && this.totalFileBytes > 220_000) {
       const cuesRace = Promise.race([
         this.ensureCuesTableLoaded(),
@@ -1439,12 +1533,7 @@ export class IosMkvStreamController {
       this.ensureCuesTableLoaded();
     }
 
-    const isResumeJump = this.initialResumeSec > 15;
-    const wantStartSec = isResumeJump
-      ? this.initialResumeSec
-      : this.skipIntroSec > 0 && (!this.totalDurationSec || this.totalDurationSec > 60)
-        ? this.skipIntroSec
-        : 0;
+    const wantStartSec = isResumeJump ? this.initialResumeSec : 0;
 
     // 2. FAST PATH A: Exact CuePoint Cluster Jump (~650 KB - 1.15 MB, ~12-18s of video!)
     if (this.cuePoints.length >= 2) {
@@ -1453,7 +1542,7 @@ export class IosMkvStreamController {
         650_000,
         1_250_000,
         11000,
-        !isResumeJump && wantStartSec > 0
+        false
       );
       if (cueRange) {
         const res = await fetch(this.url, {
@@ -1565,14 +1654,6 @@ export class IosMkvStreamController {
       } else if (firstKf === -1 && vSamples.length > 0) {
         vSamples[0].keyframe = true;
       }
-    } else if (this.skipIntroSec > 0 && (!this.totalDurationSec || this.totalDurationSec > 60)) {
-      const targetSkipMs = Math.max(9500, (this.skipIntroSec - 0.5) * 1000);
-      const kfIdx = vSamples.findIndex((s) => s.keyframe && s.ptsMs >= targetSkipMs);
-      if (kfIdx > 0 && kfIdx < vSamples.length - 25) {
-        const cutPts = vSamples[kfIdx].ptsMs;
-        vSamples = vSamples.slice(kfIdx);
-        aSamples = aSamples.filter((a) => a.ptsMs >= cutPts - 20);
-      }
     }
 
     const seg0 = this.finalizeSegmentFromSamples(
@@ -1668,13 +1749,10 @@ export class IosMkvStreamController {
 
   public ensureNextSegmentPrebuffered(
     targetIndex: number,
-    chainDepth = 0
+    _chainDepth = 0
   ): Promise<RemuxedSegmentItem | null> {
     const existing = this.segments.find((s) => s.index === targetIndex && s.blobUrl);
     if (existing) {
-      if (chainDepth === 0) {
-        this.ensureNextSegmentPrebuffered(targetIndex + 1, 1);
-      }
       return Promise.resolve(existing);
     }
     if (this.buildingPromise) return this.buildingPromise;
@@ -1692,7 +1770,7 @@ export class IosMkvStreamController {
 
         if (!this.eofReached) {
           const rangeStart = this.nextByteOffset;
-          const desiredBytes = chainDepth === 0 ? 2_200_000 : 2_800_000;
+          const desiredBytes = 1_350_000;
           let rangeEnd =
             this.totalFileBytes > 0
               ? Math.min(this.totalFileBytes - 1, rangeStart + desiredBytes - 1)
@@ -1700,7 +1778,7 @@ export class IosMkvStreamController {
 
           if (this.cuePoints.length >= 2) {
             const nextCue = this.cuePoints.find(
-              (c) => c.byteOffset >= rangeStart + 1_400_000 && c.byteOffset <= rangeStart + desiredBytes + 900_000
+              (c) => c.byteOffset >= rangeStart + 900_000 && c.byteOffset <= rangeStart + desiredBytes + 700_000
             );
             if (nextCue) {
               rangeEnd = nextCue.byteOffset - 1;
@@ -1753,8 +1831,8 @@ export class IosMkvStreamController {
         );
         if (seg) {
           this.segments.push(seg);
-          if (this.segments.length > 7) {
-            const toRemove = this.segments.slice(0, this.segments.length - 7);
+          if (this.segments.length > 5) {
+            const toRemove = this.segments.slice(0, this.segments.length - 5);
             for (const old of toRemove) {
               if (old.blobUrl) {
                 try {
@@ -1777,12 +1855,7 @@ export class IosMkvStreamController {
           this.bgPrebufferAbortController = null;
         }
       }
-    })().then((seg) => {
-      if (seg && chainDepth < 1 && !this.aborted && !this.eofReached) {
-        this.ensureNextSegmentPrebuffered(targetIndex + 1, chainDepth + 1);
-      }
-      return seg;
-    });
+    })();
 
     return this.buildingPromise;
   }
@@ -1793,20 +1866,9 @@ export class IosMkvStreamController {
     }
 
     const maxDur = this.totalDurationSec > 0 ? this.totalDurationSec : 99999;
-    const clampedSec = Math.max(0, Math.min(maxDur - 4, targetSec));
+    const clampedSec = Math.max(0, Math.min(maxDur - 2, targetSec));
 
-    // 1. Instant 0ms RAM Cache Check: If targetSec is already inside any buffered segment in RAM, return it in 0ms!
-    const ramHit = this.segments.find(
-      (s) =>
-        Boolean(s.blobUrl) &&
-        clampedSec >= s.startSec - 0.5 &&
-        clampedSec < s.startSec + s.durationSec - 1.2
-    );
-    if (ramHit) {
-      return ramHit;
-    }
-
-    // 2. Abort any previous in-flight seek or background prebuffer immediately so 100% of bandwidth goes to this seek!
+    // Abort any previous in-flight seek or background prebuffer immediately so 100% of bandwidth goes to this seek!
     try {
       this.seekAbortController?.abort();
     } catch {
@@ -1835,7 +1897,7 @@ export class IosMkvStreamController {
       let endByte = 0;
       let exactAligned = false;
 
-      // 3. Exact CuePoint Lookup (~550 KB - 1.1 MB micro-chunk for ~10-16s of video!)
+      // Exact CuePoint Lookup (~550 KB - 1.1 MB micro-chunk for ~10-16s of video!)
       const cueRange = this.findExactCueByteRange(clampedSec, 550_000, 1_150_000, 10000, false);
       if (cueRange) {
         startByte = cueRange.startByte;
@@ -1888,10 +1950,22 @@ export class IosMkvStreamController {
       const vSamples = parsed.videoSamples.slice(firstKfIdx);
       const aSamples = parsed.audioSamples.filter((a) => a.ptsMs >= cutPts - 20);
 
-      // Reset monotonic PTS tracker on explicit user seek!
+      // Reset monotonic PTS tracker and clear old prebuffered segments on explicit user seek!
       this.lastEmittedVideoPtsMs = -1;
       this.carryVideo = [];
       this.carryAudio = [];
+      for (const old of this.segments) {
+        if (old.blobUrl) {
+          try {
+            URL.revokeObjectURL(old.blobUrl);
+          } catch {
+            // ignore
+          }
+          old.blobUrl = '';
+        }
+      }
+      this.segments = [];
+
       const newIdx = Math.floor(Date.now() % 100000);
       const seg = this.finalizeSegmentFromSamples(
         newIdx,

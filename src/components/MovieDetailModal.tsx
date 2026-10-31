@@ -408,19 +408,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const [copiedShare, setCopiedShare] = useState(false);
   const [copiedBatch, setCopiedBatch] = useState(false);
 
-  // Intro Voice-Tag Blocker & Skipper (Default 12s so upstream "this video..." audio tag is 100% muted & skipped!)
-  const [introSkipSec, setIntroSkipSec] = useState<number>(() => {
-    try {
-      const saved = localStorage.getItem(INTRO_SKIP_STORAGE_KEY);
-      if (saved !== null) {
-        const num = Number(saved);
-        return num >= 0 ? num : 12;
-      }
-      return 12;
-    } catch {
-      return 12;
-    }
-  });
+  // Start immediately at 0:00 (0ms delay, single HTTP Range request) just like native streaming players
+  const [introSkipSec, setIntroSkipSec] = useState<number>(0);
 
   // Auto-Play Next Episode
   const [autoNextEp, setAutoNextEp] = useState<boolean>(() => {
@@ -459,6 +448,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const preloadVideoRef = useRef<HTMLVideoElement | null>(null);
   const playerStageRef = useRef<HTMLDivElement | null>(null);
+  const scrubberRef = useRef<HTMLDivElement | null>(null);
+  const isScrubbingRef = useRef<boolean>(false);
+  const scrubTargetSecRef = useRef<number>(0);
+  const lastTouchSeekTimeRef = useRef<number>(0);
+  const isSeekingRef = useRef<boolean>(false);
+  const seekReqIdRef = useRef<number>(0);
+  const iosSegmentStartSecRef = useRef<number>(0);
+  const iosCurrentSegIndexRef = useRef<number>(0);
   const overlayTimerRef = useRef<number | null>(null);
   const hudTimerRef = useRef<number | null>(null);
   const holdTimerRef = useRef<number | null>(null);
@@ -992,6 +989,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         iosControllerRef.current.destroy();
         iosControllerRef.current = null;
       }
+      isSeekingRef.current = false;
+      iosSegmentStartSecRef.current = 0;
+      iosCurrentSegIndexRef.current = 0;
       setIosBlobUrl('');
       setIosSegmentStartSec(0);
       setIosCurrentSegIndex(0);
@@ -1025,6 +1025,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const ctrl = new IosMkvStreamController(rawUrl, introSkipSec, initialResumeTarget);
     iosControllerRef.current = ctrl;
     iosTransitioningRef.current = false;
+    isSeekingRef.current = false;
+    iosSegmentStartSecRef.current = 0;
+    iosCurrentSegIndexRef.current = 0;
     setIosBlobUrl('');
     setIosSegmentStartSec(0);
     setIosCurrentSegIndex(0);
@@ -1040,6 +1043,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           setDuration(Math.floor(totalDur));
         }
 
+        iosCurrentSegIndexRef.current = seg0.index;
+        iosSegmentStartSecRef.current = seg0.startSec;
+        lastRecordedSecondRef.current = Math.floor(seg0.startSec);
         setIosCurrentSegIndex(seg0.index);
         setIosSegmentStartSec(seg0.startSec);
         setIosBlobUrl(seg0.blobUrl);
@@ -1088,7 +1094,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     return rawUrl;
   }, [activeSource?.url, useHlsBridge, iosBlobUrl, isEmbedSource]);
 
-  // Immediately trigger native video.play() inside useLayoutEffect (preserving user tap gesture!)
   // Immediately trigger native video.play() inside useLayoutEffect (preserving user tap gesture!)
   // and only show buffering spinner if the stream takes > 600ms so instant streams never flash a spinner!
   useLayoutEffect(() => {
@@ -1174,17 +1179,10 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         }
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        if (videoRef.current) {
-          videoRef.current.currentTime = Math.min(
-            videoRef.current.duration || 99999,
-            videoRef.current.currentTime + 10
-          );
-        }
+        handleSeekRelative(10);
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        if (videoRef.current) {
-          videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10);
-        }
+        handleSeekRelative(-10);
       } else if (e.key === 'm' || e.key === 'M') {
         e.preventDefault();
         setIsMuted((prev) => {
@@ -1196,7 +1194,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [movie]);
+  }, [movie, currentTime, duration]);
 
   // Listen to network speed changes only to update the status label (never tear down the active video mid-play!)
   useEffect(() => {
@@ -1220,11 +1218,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const advanceToNextIosSegment = async (): Promise<boolean> => {
     const ctrl = iosControllerRef.current;
-    if (!ctrl || iosTransitioningRef.current) return false;
+    if (!ctrl || iosTransitioningRef.current || isSeekingRef.current) return false;
     iosTransitioningRef.current = true;
     try {
-      const nextSeg = await ctrl.ensureNextSegmentPrebuffered(iosCurrentSegIndex + 1);
-      if (nextSeg && iosControllerRef.current === ctrl) {
+      const nextSeg = await ctrl.ensureNextSegmentPrebuffered(iosCurrentSegIndexRef.current + 1);
+      if (nextSeg && iosControllerRef.current === ctrl && !isSeekingRef.current) {
+        iosCurrentSegIndexRef.current = nextSeg.index;
+        iosSegmentStartSecRef.current = nextSeg.startSec;
         setIosCurrentSegIndex(nextSeg.index);
         setIosSegmentStartSec(nextSeg.startSec);
         setIosBlobUrl(nextSeg.blobUrl);
@@ -1248,31 +1248,39 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           : !useHlsBridge && v?.duration
             ? v.duration
             : 99999;
-    const clamped = Math.max(0, Math.min(maxDur, targetGlobalSec));
-    setCurrentTime(Math.floor(clamped));
+    const clamped = Math.max(0, Math.min(maxDur - 1, targetGlobalSec));
+    const roundedTarget = Math.floor(clamped);
+    lastRecordedSecondRef.current = roundedTarget;
+    setCurrentTime(roundedTarget);
     resetOverlayAutoHide();
 
     if (!useHlsBridge || !iosControllerRef.current) {
       if (v) {
+        isSeekingRef.current = true;
         try {
           v.currentTime = clamped;
           if (v.paused) v.play().catch(() => {});
         } catch {
           // ignore
         }
+        window.setTimeout(() => {
+          isSeekingRef.current = false;
+        }, 550);
       }
       return;
     }
 
+    const segStart = iosSegmentStartSecRef.current;
     const segDur = v?.duration || 0;
     if (
       v &&
+      !isSeekingRef.current &&
       segDur > 1 &&
-      clamped >= iosSegmentStartSec &&
-      clamped < iosSegmentStartSec + segDur - 0.5
+      clamped >= segStart &&
+      clamped < segStart + segDur - 0.6
     ) {
       try {
-        v.currentTime = Math.max(0, clamped - iosSegmentStartSec);
+        v.currentTime = Math.max(0, clamped - segStart);
         if (v.paused) v.play().catch(() => {});
       } catch {
         // ignore
@@ -1281,9 +1289,20 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     }
 
     const ctrl = iosControllerRef.current;
+    const reqId = ++seekReqIdRef.current;
+    isSeekingRef.current = true;
     setIsBuffering(true);
+    // Pause old segment immediately so it never fires onTimeUpdate or onEnded with the old timestamp while seeking!
+    if (v && !v.paused) {
+      try {
+        v.pause();
+      } catch {
+        // ignore
+      }
+    }
+
     ctrl.seekToSeconds(clamped).then((seekSeg) => {
-      if (iosControllerRef.current !== ctrl) return;
+      if (iosControllerRef.current !== ctrl || seekReqIdRef.current !== reqId) return;
       const latestTotal = ctrl.getTotalDurationSec();
       if (latestTotal > 0 && Math.floor(latestTotal) !== duration) {
         setDuration(Math.floor(latestTotal));
@@ -1291,24 +1310,26 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       if (seekSeg) {
         const offsetInsideSeg = Math.max(
           0,
-          Math.min((seekSeg.durationSec || 12) - 0.5, clamped - seekSeg.startSec)
+          Math.min((seekSeg.durationSec || 10) - 0.5, clamped - seekSeg.startSec)
         );
-        if (seekSeg.blobUrl === iosBlobUrl && v) {
-          setIosCurrentSegIndex(seekSeg.index);
-          setIosSegmentStartSec(seekSeg.startSec);
-          try {
-            v.currentTime = offsetInsideSeg;
-            if (v.paused) v.play().catch(() => {});
-          } catch {
-            // ignore
+        const exactDisplaySec = Math.floor(seekSeg.startSec + offsetInsideSeg);
+        iosCurrentSegIndexRef.current = seekSeg.index;
+        iosSegmentStartSecRef.current = seekSeg.startSec;
+        lastRecordedSecondRef.current = exactDisplaySec;
+        pendingResumeSecRef.current = offsetInsideSeg > 0.35 ? offsetInsideSeg : null;
+        setIosCurrentSegIndex(seekSeg.index);
+        setIosSegmentStartSec(seekSeg.startSec);
+        setIosBlobUrl(seekSeg.blobUrl);
+        setCurrentTime(exactDisplaySec);
+        window.setTimeout(() => {
+          if (seekReqIdRef.current === reqId) {
+            isSeekingRef.current = false;
           }
-          setCurrentTime(Math.floor(seekSeg.startSec + offsetInsideSeg));
-        } else {
-          pendingResumeSecRef.current = offsetInsideSeg > 0.4 ? offsetInsideSeg : null;
-          setIosCurrentSegIndex(seekSeg.index);
-          setIosSegmentStartSec(seekSeg.startSec);
-          setIosBlobUrl(seekSeg.blobUrl);
-          setCurrentTime(Math.floor(seekSeg.startSec + offsetInsideSeg));
+        }, 750);
+      } else {
+        isSeekingRef.current = false;
+        if (v && v.paused) {
+          v.play().catch(() => {});
         }
       }
       setIsBuffering(false);
@@ -1329,6 +1350,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setShowAllEpisodesModal(false);
     setNextEpPrewarmed(false);
     prewarmedNextEpIdxRef.current = null;
+    isSeekingRef.current = false;
+    iosSegmentStartSecRef.current = 0;
+    iosCurrentSegIndexRef.current = 0;
     setCurrentTime(0);
     setBufferedEnd(0);
     smoothPlaySecondsRef.current = 0;
@@ -1424,7 +1448,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   // Enforces 0% volume during the 0s..introSkipSec upstream voice-tag window so external site audio tags NEVER play, without seeking the Matroska stream!
   const syncCleanAudioVolume = (v: HTMLVideoElement) => {
     const dur = duration || v.duration || 0;
-    const globalTime = useHlsBridge ? iosSegmentStartSec + v.currentTime : v.currentTime;
+    const globalTime = useHlsBridge ? iosSegmentStartSecRef.current + v.currentTime : v.currentTime;
     const inVoiceTagWindow =
       introSkipSec > 0 &&
       globalTime < introSkipSec - 0.25 &&
@@ -1442,7 +1466,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const v = e.currentTarget;
     v.playbackRate = isHold2x ? 2.0 : playbackSpeed;
     const totalFromCtrl = iosControllerRef.current?.getTotalDurationSec() || 0;
-    setDuration(Math.floor(totalFromCtrl > 0 ? totalFromCtrl : v.duration || 0));
+    if (totalFromCtrl > 0) {
+      setDuration(Math.floor(totalFromCtrl));
+    } else if (!useHlsBridge && v.duration > 0) {
+      setDuration(Math.floor(v.duration));
+    }
     setHasStartedPlayback(true);
     setIsBuffering(false);
 
@@ -1459,6 +1487,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           // ignore
         }
       }
+      isSeekingRef.current = false;
       startVideoWithiOSFallback(v);
       return;
     }
@@ -1472,6 +1501,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       } catch {
         // ignore
       }
+      isSeekingRef.current = false;
       syncCleanAudioVolume(v);
       startVideoWithiOSFallback(v);
       return;
@@ -1495,27 +1525,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       } catch {
         // ignore
       }
+      isSeekingRef.current = false;
       syncCleanAudioVolume(v);
       startVideoWithiOSFallback(v);
       return;
     }
 
-    // 3. Skip the 12s upstream voice-tag intro on Frame 0 before playback starts so it never plays or jumps later!
-    if (
-      !hasAppliedIntroSkipRef.current &&
-      introSkipSec > 0 &&
-      (!v.duration || v.duration > introSkipSec + 30) &&
-      v.currentTime < introSkipSec - 1
-    ) {
-      hasAppliedIntroSkipRef.current = true;
-      try {
-        v.currentTime = introSkipSec;
-        setCurrentTime(introSkipSec);
-      } catch {
-        // ignore
-      }
-    }
-
+    isSeekingRef.current = false;
     syncCleanAudioVolume(v);
     startVideoWithiOSFallback(v);
   };
@@ -2164,8 +2180,16 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const isRotated90 = !isMiniPlayer && (isLandscapeMode || isFullscreen) && isViewportPortrait;
 
-  const computeScrubberTarget = (clientX: number, clientY: number, el: HTMLDivElement) => {
-    const rect = el.getBoundingClientRect();
+  const computeScrubberTarget = (
+    clientX: number,
+    clientY: number,
+    el?: HTMLDivElement | null
+  ) => {
+    const targetEl = el || scrubberRef.current;
+    if (!targetEl) {
+      return { targetSec: currentTime, percent: progressPercent };
+    }
+    const rect = targetEl.getBoundingClientRect();
     const ratio = isRotated90
       ? (clientY - rect.top) / Math.max(1, rect.height)
       : (clientX - rect.left) / Math.max(1, rect.width);
@@ -2174,33 +2198,24 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     return { targetSec, percent: clampedRatio * 100 };
   };
 
-  const previewScrubberAtPointer = (clientX: number, clientY: number, el: HTMLDivElement) => {
+  const previewScrubberAtPointer = (
+    clientX: number,
+    clientY: number,
+    el?: HTMLDivElement | null
+  ) => {
     const { targetSec, percent } = computeScrubberTarget(clientX, clientY, el);
+    scrubTargetSecRef.current = targetSec;
+    lastRecordedSecondRef.current = targetSec;
     setScrubPreview({ sec: targetSec, percent });
     setCurrentTime(targetSec);
-    // Pre-fetch the 650KB Matroska Cluster at the hovered/dragged timestamp BEFORE the user releases their finger!
-    if (useHlsBridge && iosControllerRef.current) {
-      iosControllerRef.current.prewarmSeekTarget(targetSec);
-    }
     return targetSec;
   };
 
   const commitScrubberSeek = (targetSec: number) => {
+    scrubTargetSecRef.current = targetSec;
+    lastRecordedSecondRef.current = targetSec;
     setCurrentTime(targetSec);
-    if (useHlsBridge) {
-      seekVideoToGlobalTime(targetSec);
-    } else if (videoRef.current) {
-      try {
-        videoRef.current.currentTime = targetSec;
-      } catch {
-        // ignore
-      }
-    }
-  };
-
-  const handleScrubberPointerSeek = (clientX: number, clientY: number, el: HTMLDivElement) => {
-    const targetSec = previewScrubberAtPointer(clientX, clientY, el);
-    commitScrubberSeek(targetSec);
+    seekVideoToGlobalTime(targetSec);
   };
 
   const hasNextEpisode = episodes.length > 1 && selectedEpIdx + 1 < episodes.length;
@@ -2607,6 +2622,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   syncCleanAudioVolume(e.currentTarget);
                 }}
                 onLoadedData={(e) => {
+                  isSeekingRef.current = false;
                   setHasStartedPlayback(true);
                   setIsBuffering(false);
                   syncCleanAudioVolume(e.currentTarget);
@@ -2620,6 +2636,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   syncCleanAudioVolume(e.currentTarget);
                 }}
                 onPause={() => {
+                  if (isSeekingRef.current) return;
                   setIsPlaying(false);
                   setShowOverlayControls(true);
                 }}
@@ -2629,6 +2646,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 }}
                 onCanPlay={(e) => {
                   const v = e.currentTarget;
+                  isSeekingRef.current = false;
                   setHasStartedPlayback(true);
                   setIsBuffering(false);
                   syncCleanAudioVolume(v);
@@ -2638,6 +2656,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 }}
                 onSeeked={(e) => {
                   const v = e.currentTarget;
+                  isSeekingRef.current = false;
                   setHasStartedPlayback(true);
                   setIsBuffering(false);
                   syncCleanAudioVolume(v);
@@ -2647,16 +2666,24 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 }}
                 onLoadedMetadata={handleVideoLoadedMetadata}
                 onProgress={(e) => {
+                  if (isSeekingRef.current) return;
                   const v = e.currentTarget;
                   if (v.buffered && v.buffered.length > 0) {
                     const localBufEnd = v.buffered.end(v.buffered.length - 1);
                     setBufferedEnd(
-                      useHlsBridge ? iosSegmentStartSec + localBufEnd : localBufEnd
+                      useHlsBridge ? iosSegmentStartSecRef.current + localBufEnd : localBufEnd
                     );
                   }
                 }}
                 onTimeUpdate={(e) => {
-                  if (isScrubbing) return;
+                  if (
+                    isScrubbing ||
+                    isScrubbingRef.current ||
+                    isSeekingRef.current ||
+                    iosTransitioningRef.current
+                  ) {
+                    return;
+                  }
                   const v = e.currentTarget;
                   syncCleanAudioVolume(v);
                   if (v.readyState >= 2) {
@@ -2668,14 +2695,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     useHlsBridge &&
                     iosControllerRef.current &&
                     segDur > 0 &&
-                    segDur - v.currentTime < 24
+                    segDur - v.currentTime < 6.5
                   ) {
                     iosControllerRef.current.ensureNextSegmentPrebuffered(
-                      iosCurrentSegIndex + 1
+                      iosCurrentSegIndexRef.current + 1
                     );
                   }
                   const globalSec = Math.floor(
-                    useHlsBridge ? iosSegmentStartSec + v.currentTime : v.currentTime
+                    useHlsBridge ? iosSegmentStartSecRef.current + v.currentTime : v.currentTime
                   );
                   const totalFromCtrl = iosControllerRef.current?.getTotalDurationSec() || 0;
                   const dur = Math.floor(totalFromCtrl > 0 ? totalFromCtrl : segDur);
@@ -2717,6 +2744,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   }
                 }}
                 onEnded={() => {
+                  if (isScrubbing || isScrubbingRef.current || isSeekingRef.current) {
+                    return;
+                  }
                   if (sleepTimerMode === 'end_of_ep') {
                     setIsPlaying(false);
                     setSleepTimerMode(null);
@@ -3068,49 +3098,65 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
               {/* Sleek Interactive Scrubber Bar (Supports Touch Drag, Mouse Drag, and Tap-to-Seek in Portrait & Landscape) */}
               <div
+                ref={scrubberRef}
                 data-scrubber="true"
                 onClick={(e) => {
                   e.stopPropagation();
-                  handleScrubberPointerSeek(e.clientX, e.clientY, e.currentTarget);
+                  if (Date.now() - lastTouchSeekTimeRef.current < 500) return;
+                  const { targetSec } = computeScrubberTarget(
+                    e.clientX,
+                    e.clientY,
+                    e.currentTarget
+                  );
+                  commitScrubberSeek(targetSec);
                 }}
                 onMouseDown={(e) => {
                   e.stopPropagation();
+                  if (e.button !== 0 || Date.now() - lastTouchSeekTimeRef.current < 500) return;
+                  const barEl = e.currentTarget;
+                  isScrubbingRef.current = true;
                   setIsScrubbing(true);
                   resetOverlayAutoHide();
+                  previewScrubberAtPointer(e.clientX, e.clientY, barEl);
+
+                  const onWinMouseMove = (ev: MouseEvent) => {
+                    if (!isScrubbingRef.current) return;
+                    previewScrubberAtPointer(ev.clientX, ev.clientY, barEl);
+                  };
+                  const onWinMouseUp = (ev: MouseEvent) => {
+                    window.removeEventListener('mousemove', onWinMouseMove);
+                    window.removeEventListener('mouseup', onWinMouseUp);
+                    if (!isScrubbingRef.current) return;
+                    isScrubbingRef.current = false;
+                    setIsScrubbing(false);
+                    const { targetSec } = computeScrubberTarget(ev.clientX, ev.clientY, barEl);
+                    setScrubPreview(null);
+                    lastTouchSeekTimeRef.current = Date.now();
+                    commitScrubberSeek(targetSec);
+                    resetOverlayAutoHide();
+                  };
+                  window.addEventListener('mousemove', onWinMouseMove);
+                  window.addEventListener('mouseup', onWinMouseUp);
                 }}
                 onMouseMove={(e) => {
                   e.stopPropagation();
+                  if (isScrubbingRef.current) return;
                   const { targetSec, percent } = computeScrubberTarget(
                     e.clientX,
                     e.clientY,
                     e.currentTarget
                   );
                   setScrubPreview({ sec: targetSec, percent });
-                  if (isScrubbing) {
-                    setCurrentTime(targetSec);
-                  }
-                }}
-                onMouseUp={(e) => {
-                  e.stopPropagation();
-                  if (isScrubbing) {
-                    setIsScrubbing(false);
-                    const { targetSec } = computeScrubberTarget(
-                      e.clientX,
-                      e.clientY,
-                      e.currentTarget
-                    );
-                    commitScrubberSeek(targetSec);
-                  }
                 }}
                 onMouseLeave={() => {
-                  if (isScrubbing && scrubPreview !== null) {
-                    setIsScrubbing(false);
-                    commitScrubberSeek(scrubPreview.sec);
+                  if (!isScrubbingRef.current) {
+                    setScrubPreview(null);
                   }
-                  setScrubPreview(null);
                 }}
                 onTouchStart={(e) => {
                   e.stopPropagation();
+                  lastTouchSeekTimeRef.current = Date.now();
+                  isScrubbingRef.current = true;
                   setIsScrubbing(true);
                   resetOverlayAutoHide();
                   if (e.touches[0]) {
@@ -3123,6 +3169,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 }}
                 onTouchMove={(e) => {
                   e.stopPropagation();
+                  lastTouchSeekTimeRef.current = Date.now();
                   if (e.touches[0]) {
                     previewScrubberAtPointer(
                       e.touches[0].clientX,
@@ -3133,75 +3180,29 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 }}
                 onTouchEnd={(e) => {
                   e.stopPropagation();
+                  lastTouchSeekTimeRef.current = Date.now();
+                  isScrubbingRef.current = false;
                   setIsScrubbing(false);
                   const changed = e.changedTouches?.[0];
-                  if (changed) {
-                    const { targetSec } = computeScrubberTarget(
-                      changed.clientX,
-                      changed.clientY,
-                      e.currentTarget
-                    );
-                    commitScrubberSeek(targetSec);
-                  } else if (scrubPreview !== null) {
-                    commitScrubberSeek(scrubPreview.sec);
-                  }
+                  const finalSec = changed
+                    ? computeScrubberTarget(changed.clientX, changed.clientY, e.currentTarget)
+                        .targetSec
+                    : scrubTargetSecRef.current;
                   setScrubPreview(null);
+                  commitScrubberSeek(finalSec);
                   resetOverlayAutoHide();
                 }}
-                className="relative flex-1 min-w-[60px] flex items-center h-8 cursor-pointer touch-none select-none"
+                onTouchCancel={(e) => {
+                  e.stopPropagation();
+                  lastTouchSeekTimeRef.current = Date.now();
+                  isScrubbingRef.current = false;
+                  setIsScrubbing(false);
+                  setScrubPreview(null);
+                  commitScrubberSeek(scrubTargetSecRef.current);
+                  resetOverlayAutoHide();
+                }}
+                className="relative flex-1 min-w-[60px] flex items-center h-9 py-2 cursor-pointer touch-none select-none"
               >
-                {/* Native Range Input Layer for 100% Reliable Mobile & Desktop Dragging */}
-                <input
-                  type="range"
-                  min={0}
-                  max={effectiveDuration}
-                  step={1}
-                  value={Math.min(effectiveDuration, Math.max(0, activePlayheadSec))}
-                  onClick={(e) => e.stopPropagation()}
-                  onTouchStart={(e) => {
-                    e.stopPropagation();
-                    setIsScrubbing(true);
-                    resetOverlayAutoHide();
-                  }}
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                    setIsScrubbing(true);
-                    resetOverlayAutoHide();
-                  }}
-                  onChange={(e) => {
-                    e.stopPropagation();
-                    const nextSec = Number(e.target.value);
-                    const pct = (nextSec / effectiveDuration) * 100;
-                    setIsScrubbing(true);
-                    setScrubPreview({ sec: nextSec, percent: pct });
-                    setCurrentTime(nextSec);
-                  }}
-                  onTouchEnd={(e) => {
-                    e.stopPropagation();
-                    const finalSec =
-                      scrubPreview !== null
-                        ? scrubPreview.sec
-                        : Number((e.currentTarget as HTMLInputElement).value);
-                    setIsScrubbing(false);
-                    setScrubPreview(null);
-                    commitScrubberSeek(finalSec);
-                    resetOverlayAutoHide();
-                  }}
-                  onMouseUp={(e) => {
-                    e.stopPropagation();
-                    const finalSec =
-                      scrubPreview !== null
-                        ? scrubPreview.sec
-                        : Number((e.currentTarget as HTMLInputElement).value);
-                    setIsScrubbing(false);
-                    setScrubPreview(null);
-                    commitScrubberSeek(finalSec);
-                    resetOverlayAutoHide();
-                  }}
-                  aria-label="Seek video timeline"
-                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-30 touch-none"
-                />
-
                 {/* Floating Scrubber Preview Card (Thumbnail + Target Timestamp) */}
                 {scrubPreview !== null && displayDuration > 0 && (
                   <div
@@ -3225,7 +3226,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   </div>
                 )}
 
-                <div className="w-full h-1.5 bg-white/30 rounded-full overflow-hidden relative">
+                <div className="w-full h-2 bg-white/30 rounded-full overflow-hidden relative pointer-events-none">
                   <div
                     className="absolute inset-y-0 left-0 bg-white/45 transition-all duration-200"
                     style={{ width: `${bufferedPercent}%` }}
@@ -3236,7 +3237,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   />
                 </div>
                 <div
-                  className="w-3.5 h-3.5 rounded-full bg-[#00e68a] border-2 border-white shadow-[0_0_8px_rgba(0,230,138,0.95)] pointer-events-none absolute -translate-x-1/2"
+                  className="w-4 h-4 rounded-full bg-[#00e68a] border-2 border-white shadow-[0_0_10px_rgba(0,230,138,0.95)] pointer-events-none absolute -translate-x-1/2"
                   style={{ left: `${progressPercent}%` }}
                 />
               </div>
