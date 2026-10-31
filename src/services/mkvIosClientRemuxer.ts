@@ -1234,11 +1234,13 @@ export class IosMkvStreamController {
 
     this.cuesPromise = (async () => {
       try {
-        const tailStart =
-          this.cuesByteOffset > 0 && this.cuesByteOffset < this.totalFileBytes
-            ? this.cuesByteOffset
-            : Math.max(0, this.totalFileBytes - 384 * 1024);
-        const tailEnd = Math.min(this.totalFileBytes - 1, tailStart + 220 * 1024 - 1);
+        const hasExactCuesOffset =
+          this.cuesByteOffset > 0 && this.cuesByteOffset < this.totalFileBytes;
+        const tailStart = hasExactCuesOffset
+          ? this.cuesByteOffset
+          : Math.max(0, this.totalFileBytes - 320 * 1024);
+        const maxWindow = hasExactCuesOffset ? 140 * 1024 : 220 * 1024;
+        const tailEnd = Math.min(this.totalFileBytes - 1, tailStart + maxWindow - 1);
         const res = await fetch(this.url, {
           signal: this.abortController.signal,
           headers: {
@@ -1261,6 +1263,9 @@ export class IosMkvStreamController {
           const existingMeta = mkvStreamMetaCache.get(this.url);
           if (existingMeta) {
             existingMeta.cuePoints = cues;
+            if (!existingMeta.totalDurationSec && this.totalDurationSec > 0) {
+              existingMeta.totalDurationSec = this.totalDurationSec;
+            }
           }
         }
         return cues;
@@ -1280,9 +1285,9 @@ export class IosMkvStreamController {
    */
   private findExactCueByteRange(
     targetSec: number,
-    minBytes = 900_000,
-    maxBytes = 1_850_000,
-    minDurationMs = 15000,
+    minBytes = 650_000,
+    maxBytes = 1_350_000,
+    minDurationMs = 11000,
     preferAtOrAfter = false
   ): { startByte: number; endByte: number; exactAligned: boolean } | null {
     if (this.cuePoints.length < 2) return null;
@@ -1290,12 +1295,9 @@ export class IosMkvStreamController {
 
     let startIdx = 0;
     if (preferAtOrAfter) {
-      // For intro-skip (e.g. 12s), pick the first keyframe at or after (targetSec - 0.5s)
-      // so we never start at 8s inside the muted intro window!
       const idx = this.cuePoints.findIndex((c) => c.timeMs >= Math.max(0, targetMs - 500));
       startIdx = idx !== -1 ? idx : 0;
     } else {
-      // Binary search for the last CuePoint <= targetMs
       let lo = 0;
       let hi = this.cuePoints.length - 1;
       while (lo <= hi) {
@@ -1312,8 +1314,6 @@ export class IosMkvStreamController {
     const startCue = this.cuePoints[startIdx];
     const startByte = startCue.byteOffset;
 
-    // Step forward through CuePoints until we have at least `minDurationMs` (or hit a hard byte ceiling)
-    // so `seg0` never ends after just 2-6 seconds!
     let endIdx = startIdx + 1;
     while (endIdx < this.cuePoints.length) {
       const cand = this.cuePoints[endIdx];
@@ -1323,11 +1323,11 @@ export class IosMkvStreamController {
         break;
       }
       if (durSpan >= minDurationMs * 1.4 || byteSpan >= maxBytes) {
-        if (durSpan >= Math.min(10000, minDurationMs)) {
+        if (durSpan >= Math.min(8000, minDurationMs)) {
           break;
         }
       }
-      if (byteSpan >= maxBytes * 1.75) {
+      if (byteSpan >= maxBytes * 1.65) {
         break;
       }
       endIdx++;
@@ -1355,44 +1355,16 @@ export class IosMkvStreamController {
     };
   }
 
-  /**
-   * Predictive Scrubber Pre-Warmer:
-   * Called while the user's finger is sliding across the seekbar so the exact Cluster
-   * at their target timestamp starts downloading BEFORE they even lift their finger!
-   */
-  public prewarmSeekTarget(targetSec: number): void {
-    if (this.aborted || this.cuePoints.length < 2) return;
-    const range = this.findExactCueByteRange(targetSec, 700_000, 1_450_000, 12000, false);
-    if (!range) return;
-    if (
-      this.prewarmedSeekSlice &&
-      Math.abs(this.prewarmedSeekSlice.startByte - range.startByte) < 250_000
-    ) {
-      return;
-    }
-    const promise = fetch(this.url, {
-      signal: this.abortController.signal,
-      headers: {
-        Range: `bytes=${range.startByte}-${range.endByte}`,
-      },
-    })
-      .then((r) => (r.ok || r.status === 206 ? r.arrayBuffer() : null))
-      .then((ab) => (ab ? new Uint8Array(ab) : null))
-      .catch(() => null);
-
-    this.prewarmedSeekSlice = {
-      startByte: range.startByte,
-      endByte: range.endByte,
-      promise,
-    };
+  public prewarmSeekTarget(_targetSec: number): void {
+    // Intentionally keep network 100% free while finger is dragging across the seekbar
+    // so the committed seek on release executes with zero connection contention!
   }
 
   public async startInitialSegment(): Promise<RemuxedSegmentItem> {
     this.lastEmittedVideoPtsMs = -1;
-    // 1. Check if header/tracks/Cues were already pre-warmed in RAM (or fetch 32KB header in ~70ms)
     let meta = mkvStreamMetaCache.get(this.url);
     if (!meta || meta.tracks.length === 0) {
-      const HEADER_PROBE_BYTES = 32 * 1024;
+      const HEADER_PROBE_BYTES = 16 * 1024;
       const headRes = await fetch(this.url, {
         signal: this.abortController.signal,
         headers: {
@@ -1441,8 +1413,6 @@ export class IosMkvStreamController {
       }
     }
 
-    // Fast-fail if video track is AV1 and the user's iPhone/iOS device does not support hardware AV1 decoding,
-    // allowing the player to immediately switch to the H.264 stream source in ~60ms!
     const primaryVTrack = this.tracks.find((t) => t.type === 1);
     if (
       primaryVTrack &&
@@ -1457,11 +1427,12 @@ export class IosMkvStreamController {
       }
     }
 
-    // Wait up to 340ms for Cues table so we can jump straight to the exact 12s / resume Cluster!
+    // Wait up to 2200ms for the ~45KB Cues table so we ALWAYS jump straight to the exact 12s Cluster
+    // and have the full keyframe seek table ready for instant seeking!
     if (this.cuePoints.length === 0 && this.totalFileBytes > 220_000) {
       const cuesRace = Promise.race([
         this.ensureCuesTableLoaded(),
-        new Promise<MkvCuePoint[]>((r) => setTimeout(() => r([]), 340)),
+        new Promise<MkvCuePoint[]>((r) => setTimeout(() => r([]), 2200)),
       ]);
       await cuesRace;
     } else if (this.cuePoints.length === 0) {
@@ -1475,13 +1446,13 @@ export class IosMkvStreamController {
         ? this.skipIntroSec
         : 0;
 
-    // 2. FAST PATH A: Exact CuePoint Cluster Jump (~1.2 MB, 16-24s of continuous video!)
+    // 2. FAST PATH A: Exact CuePoint Cluster Jump (~650 KB - 1.15 MB, ~12-18s of video!)
     if (this.cuePoints.length >= 2) {
       const cueRange = this.findExactCueByteRange(
         wantStartSec,
-        950_000,
-        1_950_000,
-        16000,
+        650_000,
+        1_250_000,
+        11000,
         !isResumeJump && wantStartSec > 0
       );
       if (cueRange) {
@@ -1507,11 +1478,15 @@ export class IosMkvStreamController {
 
           let vSamples = parsed.videoSamples;
           let aSamples = parsed.audioSamples;
-          const firstKf = vSamples.findIndex((s) => s.keyframe);
-          if (firstKf > 0) {
-            const cutPts = vSamples[firstKf].ptsMs;
-            vSamples = vSamples.slice(firstKf);
-            aSamples = aSamples.filter((a) => a.ptsMs >= cutPts - 20);
+          if (vSamples.length > 0) {
+            const firstKf = vSamples.findIndex((s) => s.keyframe);
+            if (firstKf > 0) {
+              const cutPts = vSamples[firstKf].ptsMs;
+              vSamples = vSamples.slice(firstKf);
+              aSamples = aSamples.filter((a) => a.ptsMs >= cutPts - 20);
+            } else if (firstKf === -1) {
+              vSamples[0].keyframe = true;
+            }
           }
 
           const seg0 = this.finalizeSegmentFromSamples(
@@ -1529,8 +1504,8 @@ export class IosMkvStreamController {
       }
     }
 
-    // 3. FAST PATH B: Fallback 2.4 MB burst if Cues table wasn't ready yet
-    const FALLBACK_INITIAL_BYTES = 2_450_000;
+    // 3. FAST PATH B: Fallback 1.6 MB burst if Cues table wasn't present
+    const FALLBACK_INITIAL_BYTES = 1_650_000;
     let fallbackStartByte = 0;
     if (
       wantStartSec > 20 &&
@@ -1587,6 +1562,8 @@ export class IosMkvStreamController {
         const cutPts = vSamples[firstKf].ptsMs;
         vSamples = vSamples.slice(firstKf);
         aSamples = aSamples.filter((a) => a.ptsMs >= cutPts - 20);
+      } else if (firstKf === -1 && vSamples.length > 0) {
+        vSamples[0].keyframe = true;
       }
     } else if (this.skipIntroSec > 0 && (!this.totalDurationSec || this.totalDurationSec > 60)) {
       const targetSkipMs = Math.max(9500, (this.skipIntroSec - 0.5) * 1000);
@@ -1715,17 +1692,15 @@ export class IosMkvStreamController {
 
         if (!this.eofReached) {
           const rangeStart = this.nextByteOffset;
-          // 3.2 MB for immediate next segment (~30-45s), 4.2 MB for subsequent segments
-          const desiredBytes = chainDepth === 0 ? 3_200_000 : 4_200_000;
+          const desiredBytes = chainDepth === 0 ? 2_200_000 : 2_800_000;
           let rangeEnd =
             this.totalFileBytes > 0
               ? Math.min(this.totalFileBytes - 1, rangeStart + desiredBytes - 1)
               : rangeStart + desiredBytes - 1;
 
-          // Align rangeEnd to an exact CuePoint Cluster boundary if Cues table is loaded!
           if (this.cuePoints.length >= 2) {
             const nextCue = this.cuePoints.find(
-              (c) => c.byteOffset >= rangeStart + 2_100_000 && c.byteOffset <= rangeStart + desiredBytes + 1_100_000
+              (c) => c.byteOffset >= rangeStart + 1_400_000 && c.byteOffset <= rangeStart + desiredBytes + 900_000
             );
             if (nextCue) {
               rangeEnd = nextCue.byteOffset - 1;
@@ -1848,11 +1823,11 @@ export class IosMkvStreamController {
     this.seekAbortController = seekCtrl;
 
     try {
-      // Ensure Cues table is loaded if available (fast 150ms race)
+      // Ensure Cues table is loaded (wait up to 2200ms so seeking ALWAYS has exact keyframe Cluster offsets!)
       if (this.cuePoints.length === 0 && this.totalFileBytes > 220_000) {
         await Promise.race([
           this.ensureCuesTableLoaded(),
-          new Promise<MkvCuePoint[]>((r) => setTimeout(() => r([]), 150)),
+          new Promise<MkvCuePoint[]>((r) => setTimeout(() => r([]), 2200)),
         ]);
       }
 
@@ -1860,8 +1835,8 @@ export class IosMkvStreamController {
       let endByte = 0;
       let exactAligned = false;
 
-      // 3. Exact CuePoint Lookup (~900 KB - 1.5 MB micro-chunk for ~12-18s of video!)
-      const cueRange = this.findExactCueByteRange(clampedSec, 750_000, 1_550_000, 12000, false);
+      // 3. Exact CuePoint Lookup (~550 KB - 1.1 MB micro-chunk for ~10-16s of video!)
+      const cueRange = this.findExactCueByteRange(clampedSec, 550_000, 1_150_000, 10000, false);
       if (cueRange) {
         startByte = cueRange.startByte;
         endByte = cueRange.endByte;
@@ -1869,34 +1844,21 @@ export class IosMkvStreamController {
       } else {
         const approxRatio = this.totalDurationSec > 0 ? clampedSec / this.totalDurationSec : 0;
         startByte = Math.max(0, Math.floor(approxRatio * this.totalFileBytes));
-        const FALLBACK_SEEK_BYTES = 1_650_000;
-        endByte = Math.min(
-          this.totalFileBytes - 1,
-          startByte + FALLBACK_SEEK_BYTES - 1
-        );
+        const FALLBACK_SEEK_BYTES = 1_850_000;
+        endByte =
+          this.totalFileBytes > 0
+            ? Math.min(this.totalFileBytes - 1, startByte + FALLBACK_SEEK_BYTES - 1)
+            : startByte + FALLBACK_SEEK_BYTES - 1;
       }
 
-      // Check if predictive scrubber pre-warm already fetched this exact slice while finger was dragging!
-      let buf: Uint8Array | null = null;
-      if (
-        this.prewarmedSeekSlice &&
-        this.prewarmedSeekSlice.startByte === startByte &&
-        this.prewarmedSeekSlice.endByte === endByte
-      ) {
-        buf = await this.prewarmedSeekSlice.promise;
-        this.prewarmedSeekSlice = null;
-      }
-
-      if (!buf) {
-        const res = await fetch(this.url, {
-          signal: seekCtrl.signal,
-          headers: {
-            Range: `bytes=${startByte}-${endByte}`,
-          },
-        });
-        if (!res.ok && res.status !== 206) return null;
-        buf = new Uint8Array(await res.arrayBuffer());
-      }
+      const res = await fetch(this.url, {
+        signal: seekCtrl.signal,
+        headers: {
+          Range: `bytes=${startByte}-${endByte}`,
+        },
+      });
+      if (!res.ok && res.status !== 206) return null;
+      const buf = new Uint8Array(await res.arrayBuffer());
 
       if (this.aborted || seekCtrl.signal.aborted) return null;
 
@@ -1915,8 +1877,12 @@ export class IosMkvStreamController {
       this.eofReached =
         this.totalFileBytes > 0 && this.nextByteOffset >= this.totalFileBytes;
 
-      const firstKfIdx = parsed.videoSamples.findIndex((s) => s.keyframe);
-      if (firstKfIdx === -1) return null;
+      if (parsed.videoSamples.length === 0) return null;
+      let firstKfIdx = parsed.videoSamples.findIndex((s) => s.keyframe);
+      if (firstKfIdx === -1) {
+        parsed.videoSamples[0].keyframe = true;
+        firstKfIdx = 0;
+      }
 
       const cutPts = parsed.videoSamples[firstKfIdx].ptsMs;
       const vSamples = parsed.videoSamples.slice(firstKfIdx);
@@ -1924,6 +1890,8 @@ export class IosMkvStreamController {
 
       // Reset monotonic PTS tracker on explicit user seek!
       this.lastEmittedVideoPtsMs = -1;
+      this.carryVideo = [];
+      this.carryAudio = [];
       const newIdx = Math.floor(Date.now() % 100000);
       const seg = this.finalizeSegmentFromSamples(
         newIdx,

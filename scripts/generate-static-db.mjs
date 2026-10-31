@@ -460,10 +460,21 @@ function parseMovieDetail(html, itemPath, origin) {
 async function main() {
   console.log('Generating complete multi-category live cinema database...');
   const outPath = path.join(__dirname, '..', 'public', 'static-db.json');
+  const shardsDirInit = path.join(__dirname, '..', 'public', 'db-shards');
   let existingDb = { catalogs: {}, details: {} };
   try {
     const rawExisting = await fs.readFile(outPath, 'utf8');
     existingDb = JSON.parse(rawExisting);
+    existingDb.details = existingDb.details || {};
+    for (let i = 0; i < 16; i++) {
+      try {
+        const rawShard = await fs.readFile(path.join(shardsDirInit, `shard-${i.toString(16)}.json`), 'utf8');
+        const parsedShard = JSON.parse(rawShard);
+        Object.assign(existingDb.details, parsedShard.details || {});
+      } catch {
+        // ignore missing shard
+      }
+    }
   } catch {
     // ignore if missing
   }
@@ -669,21 +680,83 @@ async function main() {
     }
   }
 
+function computeShardHex(str) {
+  const s = String(str || '').toLowerCase().trim();
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return (h & 0x0f).toString(16);
+}
+
   if (Object.keys(details).length < 20 && Object.keys(existingDb.details || {}).length >= 20) {
     console.log('Keeping existing static-db.json because live mirror was unreachable.');
     return;
+  }
+
+  // Write 16 fast lookup shards (public/db-shards/shard-0.json .. shard-f.json, ~220KB each)
+  // AND keep top 60 homepage/ongoing items inside static-db.json (~650KB) so initial app load is < 80ms!
+  const shardsDir = path.join(__dirname, '..', 'public', 'db-shards');
+  await fs.mkdir(shardsDir, { recursive: true });
+  const shards = {};
+  for (let i = 0; i < 16; i++) {
+    shards[i.toString(16)] = {};
+  }
+
+  for (const [detPath, detObj] of Object.entries(details)) {
+    const k = normKey(detObj?.title);
+    const shardByTitle = computeShardHex(k || detPath);
+    const shardByPath = computeShardHex(detPath);
+    shards[shardByTitle][detPath] = detObj;
+    if (shardByPath !== shardByTitle) {
+      shards[shardByPath][detPath] = detObj;
+    }
+  }
+
+  for (const [hex, shardMap] of Object.entries(shards)) {
+    await fs.writeFile(
+      path.join(shardsDir, `shard-${hex}.json`),
+      JSON.stringify({ details: shardMap })
+    );
+  }
+
+  // Keep top 18 items from each popular category inside main static-db.json
+  // so clicking top cards on Home, Ongoing, Series, Bangla, Hindi Dubbed opens in 0ms!
+  const priorityDetails = {};
+  const priorityLists = [
+    catalogs['/'] || [],
+    catalogs['/ongoing'] || [],
+    catalogs['/new-uploads'] || [],
+    catalogs['/type/series'] || [],
+    catalogs['/language/bangla'] || [],
+    catalogs['/category/hindi-dubbed'] || [],
+    catalogs['/category/south-indian'] || [],
+  ];
+  for (const list of priorityLists) {
+    let addedFromList = 0;
+    for (const item of list) {
+      if (addedFromList >= 18) break;
+      const p = item?.path || item?.url;
+      if (p && details[p]) {
+        priorityDetails[p] = details[p];
+        addedFromList++;
+      }
+    }
   }
 
   await fs.writeFile(
     outPath,
     JSON.stringify({
       generatedAt: Date.now(),
+      sharded: true,
+      totalDetailsCount: Object.keys(details).length,
       catalogs,
-      details,
+      details: priorityDetails,
     })
   );
   console.log(
-    `Saved static-db.json with ${Object.keys(catalogs).length} full categories and ${Object.keys(details).length} pre-decrypted movie/series streams.`
+    `Saved lightweight static-db.json (${Object.keys(catalogs).length} categories, ${Object.keys(priorityDetails).length} instant items) + 16 shards (${Object.keys(details).length} total movies/series).`
   );
 }
 

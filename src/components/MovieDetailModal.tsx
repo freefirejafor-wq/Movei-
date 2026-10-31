@@ -522,6 +522,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       if (
         videoRef.current &&
         !videoRef.current.paused &&
+        !isScrubbing &&
         !showBrightnessPanel &&
         !showQualityMenu &&
         !showAudioServerMenu &&
@@ -529,7 +530,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       ) {
         setShowOverlayControls(false);
       }
-    }, 3200);
+    }, 3600);
   };
 
   // Sleep Timer Countdown Effect
@@ -1238,12 +1239,28 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const seekVideoToGlobalTime = (targetGlobalSec: number) => {
     const v = videoRef.current;
-    const maxDur = duration || v?.duration || 99999;
+    const ctrlDur = iosControllerRef.current?.getTotalDurationSec() || 0;
+    const maxDur =
+      ctrlDur > 0
+        ? ctrlDur
+        : duration > 0
+          ? duration
+          : !useHlsBridge && v?.duration
+            ? v.duration
+            : 99999;
     const clamped = Math.max(0, Math.min(maxDur, targetGlobalSec));
     setCurrentTime(Math.floor(clamped));
+    resetOverlayAutoHide();
 
     if (!useHlsBridge || !iosControllerRef.current) {
-      if (v) v.currentTime = clamped;
+      if (v) {
+        try {
+          v.currentTime = clamped;
+          if (v.paused) v.play().catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
       return;
     }
 
@@ -1254,7 +1271,12 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       clamped >= iosSegmentStartSec &&
       clamped < iosSegmentStartSec + segDur - 0.5
     ) {
-      v.currentTime = Math.max(0, clamped - iosSegmentStartSec);
+      try {
+        v.currentTime = Math.max(0, clamped - iosSegmentStartSec);
+        if (v.paused) v.play().catch(() => {});
+      } catch {
+        // ignore
+      }
       return;
     }
 
@@ -1262,11 +1284,32 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setIsBuffering(true);
     ctrl.seekToSeconds(clamped).then((seekSeg) => {
       if (iosControllerRef.current !== ctrl) return;
+      const latestTotal = ctrl.getTotalDurationSec();
+      if (latestTotal > 0 && Math.floor(latestTotal) !== duration) {
+        setDuration(Math.floor(latestTotal));
+      }
       if (seekSeg) {
-        setIosCurrentSegIndex(seekSeg.index);
-        setIosSegmentStartSec(seekSeg.startSec);
-        setIosBlobUrl(seekSeg.blobUrl);
-        setCurrentTime(Math.floor(seekSeg.startSec));
+        const offsetInsideSeg = Math.max(
+          0,
+          Math.min((seekSeg.durationSec || 12) - 0.5, clamped - seekSeg.startSec)
+        );
+        if (seekSeg.blobUrl === iosBlobUrl && v) {
+          setIosCurrentSegIndex(seekSeg.index);
+          setIosSegmentStartSec(seekSeg.startSec);
+          try {
+            v.currentTime = offsetInsideSeg;
+            if (v.paused) v.play().catch(() => {});
+          } catch {
+            // ignore
+          }
+          setCurrentTime(Math.floor(seekSeg.startSec + offsetInsideSeg));
+        } else {
+          pendingResumeSecRef.current = offsetInsideSeg > 0.4 ? offsetInsideSeg : null;
+          setIosCurrentSegIndex(seekSeg.index);
+          setIosSegmentStartSec(seekSeg.startSec);
+          setIosBlobUrl(seekSeg.blobUrl);
+          setCurrentTime(Math.floor(seekSeg.startSec + offsetInsideSeg));
+        }
       }
       setIsBuffering(false);
     });
@@ -1407,6 +1450,15 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     syncCleanAudioVolume(v);
 
     if (useHlsBridge) {
+      if (pendingResumeSecRef.current !== null && pendingResumeSecRef.current > 0.3) {
+        const localOffset = pendingResumeSecRef.current;
+        pendingResumeSecRef.current = null;
+        try {
+          v.currentTime = Math.min(Math.max(0, (v.duration || 12) - 0.4), localOffset);
+        } catch {
+          // ignore
+        }
+      }
       startVideoWithiOSFallback(v);
       return;
     }
@@ -1644,7 +1696,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   // Touch Gesture Handlers on Video Stage (Left vertical swipe = Brightness, Right vertical swipe = Volume, Double tap = +-10s, Long press = 2x Speed)
   const handleStageTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (isMiniPlayer || isScreenLocked || playerMode === 'trailer') return;
-    if ((e.target as HTMLElement).closest('button, input, select, a')) return;
+    if ((e.target as HTMLElement).closest('button, input, select, a, [data-scrubber="true"]')) return;
     if (e.touches.length !== 1) return;
 
     const touch = e.touches[0];
@@ -1912,7 +1964,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   };
 
   const handleStageClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if ((e.target as HTMLElement).closest('button, input, select, a')) return;
+    if ((e.target as HTMLElement).closest('button, input, select, a, [data-scrubber="true"]')) return;
     if (isMiniPlayer) {
       if (Date.now() - lastMiniTapTimeRef.current > 350) {
         if (onToggleMiniPlayer) onToggleMiniPlayer(false);
@@ -2090,9 +2142,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     ? (detail.communityScore.recommendedPercent / 10).toFixed(1)
     : '8.7';
 
-  const effectiveDuration = Math.max(1, duration || 0);
-  const progressPercent = duration > 0 ? Math.min(100, (currentTime / effectiveDuration) * 100) : 0;
-  const bufferedPercent = duration > 0 ? Math.min(100, (bufferedEnd / effectiveDuration) * 100) : 0;
+  const ctrlTotalDur = iosControllerRef.current?.getTotalDurationSec() || 0;
+  const displayDuration = Math.floor(duration > 0 ? duration : ctrlTotalDur > 0 ? ctrlTotalDur : 0);
+  const effectiveDuration = Math.max(1, displayDuration || 1);
+  const activePlayheadSec = isScrubbing && scrubPreview !== null ? scrubPreview.sec : currentTime;
+  const progressPercent =
+    displayDuration > 0 ? Math.min(100, (activePlayheadSec / effectiveDuration) * 100) : 0;
+  const bufferedPercent =
+    displayDuration > 0 ? Math.min(100, (bufferedEnd / effectiveDuration) * 100) : 0;
 
   // CSS video brightness boost filter (supports darkening down to 20% AND brightening dark movie scenes up to 160%)
   const videoFilterStyle: React.CSSProperties = {
@@ -3009,23 +3066,53 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 </button>
               )}
 
-              {/* Sleek Thin Scrubber Bar with Floating Thumbnail + Timestamp Preview Tooltip */}
+              {/* Sleek Interactive Scrubber Bar (Supports Touch Drag, Mouse Drag, and Tap-to-Seek in Portrait & Landscape) */}
               <div
-                onClick={(e) => handleScrubberPointerSeek(e.clientX, e.clientY, e.currentTarget)}
+                data-scrubber="true"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleScrubberPointerSeek(e.clientX, e.clientY, e.currentTarget);
+                }}
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  setIsScrubbing(true);
+                  resetOverlayAutoHide();
+                }}
                 onMouseMove={(e) => {
+                  e.stopPropagation();
                   const { targetSec, percent } = computeScrubberTarget(
                     e.clientX,
                     e.clientY,
                     e.currentTarget
                   );
                   setScrubPreview({ sec: targetSec, percent });
-                  if (useHlsBridge && iosControllerRef.current) {
-                    iosControllerRef.current.prewarmSeekTarget(targetSec);
+                  if (isScrubbing) {
+                    setCurrentTime(targetSec);
                   }
                 }}
-                onMouseLeave={() => setScrubPreview(null)}
+                onMouseUp={(e) => {
+                  e.stopPropagation();
+                  if (isScrubbing) {
+                    setIsScrubbing(false);
+                    const { targetSec } = computeScrubberTarget(
+                      e.clientX,
+                      e.clientY,
+                      e.currentTarget
+                    );
+                    commitScrubberSeek(targetSec);
+                  }
+                }}
+                onMouseLeave={() => {
+                  if (isScrubbing && scrubPreview !== null) {
+                    setIsScrubbing(false);
+                    commitScrubberSeek(scrubPreview.sec);
+                  }
+                  setScrubPreview(null);
+                }}
                 onTouchStart={(e) => {
+                  e.stopPropagation();
                   setIsScrubbing(true);
+                  resetOverlayAutoHide();
                   if (e.touches[0]) {
                     previewScrubberAtPointer(
                       e.touches[0].clientX,
@@ -3035,6 +3122,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   }
                 }}
                 onTouchMove={(e) => {
+                  e.stopPropagation();
                   if (e.touches[0]) {
                     previewScrubberAtPointer(
                       e.touches[0].clientX,
@@ -3044,6 +3132,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   }
                 }}
                 onTouchEnd={(e) => {
+                  e.stopPropagation();
                   setIsScrubbing(false);
                   const changed = e.changedTouches?.[0];
                   if (changed) {
@@ -3057,13 +3146,66 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     commitScrubberSeek(scrubPreview.sec);
                   }
                   setScrubPreview(null);
+                  resetOverlayAutoHide();
                 }}
-                className="relative flex-1 min-w-[60px] flex items-center h-6 cursor-pointer"
+                className="relative flex-1 min-w-[60px] flex items-center h-8 cursor-pointer touch-none select-none"
               >
+                {/* Native Range Input Layer for 100% Reliable Mobile & Desktop Dragging */}
+                <input
+                  type="range"
+                  min={0}
+                  max={effectiveDuration}
+                  step={1}
+                  value={Math.min(effectiveDuration, Math.max(0, activePlayheadSec))}
+                  onClick={(e) => e.stopPropagation()}
+                  onTouchStart={(e) => {
+                    e.stopPropagation();
+                    setIsScrubbing(true);
+                    resetOverlayAutoHide();
+                  }}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    setIsScrubbing(true);
+                    resetOverlayAutoHide();
+                  }}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    const nextSec = Number(e.target.value);
+                    const pct = (nextSec / effectiveDuration) * 100;
+                    setIsScrubbing(true);
+                    setScrubPreview({ sec: nextSec, percent: pct });
+                    setCurrentTime(nextSec);
+                  }}
+                  onTouchEnd={(e) => {
+                    e.stopPropagation();
+                    const finalSec =
+                      scrubPreview !== null
+                        ? scrubPreview.sec
+                        : Number((e.currentTarget as HTMLInputElement).value);
+                    setIsScrubbing(false);
+                    setScrubPreview(null);
+                    commitScrubberSeek(finalSec);
+                    resetOverlayAutoHide();
+                  }}
+                  onMouseUp={(e) => {
+                    e.stopPropagation();
+                    const finalSec =
+                      scrubPreview !== null
+                        ? scrubPreview.sec
+                        : Number((e.currentTarget as HTMLInputElement).value);
+                    setIsScrubbing(false);
+                    setScrubPreview(null);
+                    commitScrubberSeek(finalSec);
+                    resetOverlayAutoHide();
+                  }}
+                  aria-label="Seek video timeline"
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-30 touch-none"
+                />
+
                 {/* Floating Scrubber Preview Card (Thumbnail + Target Timestamp) */}
-                {scrubPreview !== null && duration > 0 && (
+                {scrubPreview !== null && displayDuration > 0 && (
                   <div
-                    className="pointer-events-none absolute bottom-7 -translate-x-1/2 z-40 flex flex-col items-center"
+                    className="pointer-events-none absolute bottom-8 -translate-x-1/2 z-40 flex flex-col items-center"
                     style={{
                       left: `${Math.max(12, Math.min(88, scrubPreview.percent))}%`,
                     }}
@@ -3083,7 +3225,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   </div>
                 )}
 
-                <div className="w-full h-[3px] bg-white/30 rounded-full overflow-hidden relative">
+                <div className="w-full h-1.5 bg-white/30 rounded-full overflow-hidden relative">
                   <div
                     className="absolute inset-y-0 left-0 bg-white/45 transition-all duration-200"
                     style={{ width: `${bufferedPercent}%` }}
@@ -3094,14 +3236,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   />
                 </div>
                 <div
-                  className="w-3 h-3 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.95)] pointer-events-none absolute -translate-x-1/2"
+                  className="w-3.5 h-3.5 rounded-full bg-[#00e68a] border-2 border-white shadow-[0_0_8px_rgba(0,230,138,0.95)] pointer-events-none absolute -translate-x-1/2"
                   style={{ left: `${progressPercent}%` }}
                 />
               </div>
 
               {/* Single Unified Timer (00:44/44:39) */}
               <div className="text-[11px] sm:text-xs font-sans tabular-nums text-white/95 shrink-0">
-                {formatSeconds(currentTime)}/{formatSeconds(duration || 0)}
+                {formatSeconds(activePlayheadSec)}/{formatSeconds(displayDuration || 0)}
               </div>
 
               {/* Auto / Manual Quality Selector Button Inside Player Bottom Bar */}

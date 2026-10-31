@@ -55,41 +55,100 @@ function normalizeLookupTitleKey(rawTitle: string): string {
     .trim();
 }
 
+const loadedShards = new Set<string>();
+const inFlightShards = new Map<string, Promise<void>>();
+
+function computeShardHex(str: string): string {
+  const s = String(str || '').toLowerCase().trim();
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return (h & 0x0f).toString(16);
+}
+
+function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>): void {
+  if (!detailsMap) return;
+  if (!loadedStaticDb) {
+    loadedStaticDb = { generatedAt: Date.now(), catalogs: {}, details: {} };
+  }
+  for (const [detPath, det] of Object.entries(detailsMap)) {
+    if (det?.title && det.episodes?.length) {
+      for (const ep of det.episodes) {
+        for (const src of ep.sources || []) {
+          if (!src.downloadUrl) {
+            src.downloadUrl = src.url;
+          } else if (src.downloadUrl.startsWith('/api/go?t=')) {
+            src.downloadUrl = resolveDirectDownloadUrl(src.downloadUrl);
+          }
+        }
+      }
+      for (const btn of det.downloadButtons || []) {
+        if (btn.url && btn.url.startsWith('/api/go?t=')) {
+          btn.url = resolveDirectDownloadUrl(btn.url);
+        }
+      }
+      loadedStaticDb.details[detPath] = det;
+      const k1 = normalizeLookupTitleKey(det.title);
+      if (k1) staticDbTitleIndex.set(k1, det);
+      const k2 = det.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (k2) staticDbTitleIndex.set(k2, det);
+    }
+  }
+}
+
+async function loadShardByHex(hex: string): Promise<void> {
+  if (!hex || loadedShards.has(hex)) return;
+  const existing = inFlightShards.get(hex);
+  if (existing) return existing;
+  const p = (async () => {
+    try {
+      const res = await fetch(`./db-shards/shard-${hex}.json`);
+      if (!res.ok) return;
+      const parsed = await res.json();
+      loadedShards.add(hex);
+      if (parsed?.details) {
+        indexDetailsIntoMemory(parsed.details);
+      }
+    } catch {
+      // ignore
+    } finally {
+      inFlightShards.delete(hex);
+    }
+  })();
+  inFlightShards.set(hex, p);
+  return p;
+}
+
+async function loadShardForMovie(rawPath: string, rawTitle: string): Promise<MovieDetailData | null> {
+  const k = normalizeLookupTitleKey(rawTitle);
+  const hexes = new Set<string>();
+  if (k) hexes.add(computeShardHex(k));
+  if (rawPath) hexes.add(computeShardHex(rawPath));
+  await Promise.all(Array.from(hexes).map((h) => loadShardByHex(h)));
+  return getInstantCachedDetail(rawPath, rawTitle);
+}
+
 async function loadStaticDb(): Promise<StaticDbSnapshot | null> {
-  if (loadedStaticDb) return loadedStaticDb;
+  if (loadedStaticDb && Object.keys(loadedStaticDb.catalogs || {}).length > 0) {
+    return loadedStaticDb;
+  }
   if (!staticDbPromise) {
     staticDbPromise = (async () => {
       try {
         const res = await fetch('./static-db.json');
         if (!res.ok) return null;
         const parsed = (await res.json()) as StaticDbSnapshot;
-        loadedStaticDb = parsed;
-        if (parsed?.details) {
-          for (const det of Object.values(parsed.details)) {
-            if (det?.title && det.episodes?.length) {
-              // Ensure all downloadUrls inside static-db.json are resolved for direct downloads
-              for (const ep of det.episodes) {
-                for (const src of ep.sources || []) {
-                  if (!src.downloadUrl) {
-                    src.downloadUrl = src.url;
-                  } else if (src.downloadUrl.startsWith('/api/go?t=')) {
-                    src.downloadUrl = resolveDirectDownloadUrl(src.downloadUrl);
-                  }
-                }
-              }
-              for (const btn of det.downloadButtons || []) {
-                if (btn.url && btn.url.startsWith('/api/go?t=')) {
-                  btn.url = resolveDirectDownloadUrl(btn.url);
-                }
-              }
-              const k1 = normalizeLookupTitleKey(det.title);
-              if (k1) staticDbTitleIndex.set(k1, det);
-              const k2 = det.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-              if (k2) staticDbTitleIndex.set(k2, det);
-            }
-          }
+        if (!loadedStaticDb) {
+          loadedStaticDb = parsed;
+        } else {
+          loadedStaticDb.catalogs = parsed.catalogs || {};
         }
-        return parsed;
+        if (parsed?.details) {
+          indexDetailsIntoMemory(parsed.details);
+        }
+        return loadedStaticDb;
       } catch {
         return null;
       }
@@ -271,28 +330,22 @@ export function getInstantCachedDetail(rawPath: string, rawTitle = ''): MovieDet
 
   const mem = clientDetailCache.get(pathKey);
   if (mem && mem.detail?.episodes?.length) {
-    warmDetailFirstStream(mem.detail);
     return mem.detail;
   }
 
   if (loadedStaticDb?.details) {
     if (pathKey && loadedStaticDb.details[pathKey]?.episodes?.length) {
-      const hit = loadedStaticDb.details[pathKey];
-      warmDetailFirstStream(hit);
-      return hit;
+      return loadedStaticDb.details[pathKey];
     }
     const strippedPath = pathKey.replace(/-\d+$/, '');
     if (strippedPath && loadedStaticDb.details[strippedPath]?.episodes?.length) {
-      const hit = loadedStaticDb.details[strippedPath];
-      warmDetailFirstStream(hit);
-      return hit;
+      return loadedStaticDb.details[strippedPath];
     }
     if (rawTitle) {
       const k1 = normalizeLookupTitleKey(rawTitle);
       const k2 = rawTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
       const indexed = (k2 && staticDbTitleIndex.get(k2)) || (k1 && staticDbTitleIndex.get(k1));
       if (indexed && indexed.episodes?.length) {
-        warmDetailFirstStream(indexed);
         return indexed;
       }
       const cleanWant = extractBaseSeriesTitle(rawTitle).toLowerCase();
@@ -302,7 +355,6 @@ export function getInstantCachedDetail(rawPath: string, rawTitle = ''): MovieDet
       });
       if (found && found.episodes?.length) {
         if (k2) staticDbTitleIndex.set(k2, found);
-        warmDetailFirstStream(found);
         return found;
       }
     }
@@ -311,60 +363,26 @@ export function getInstantCachedDetail(rawPath: string, rawTitle = ''): MovieDet
 }
 
 /**
- * Pre-fetches and decrypts a movie's stream links in the background on touchstart / hover
- * AND pre-warms the video byte stream (`Range: bytes=0-32767`) so tapping plays in 0ms!
+ * Pre-loads the 220KB static shard on hover/touchstart so clicking Play opens in 0ms
+ * without saturating the video CDN (`fsldownload.com`) with background Range fetches!
  */
 export function prefetchMovieDetails(
   rawPath: string,
   rawTitle = '',
-  nodeId = 'node-alpha',
-  primeMediaDecoder = true
+  _nodeId = 'node-alpha',
+  _primeMediaDecoder = false
 ): void {
   if (isVideoActivelyStarting) return;
   const pathKey = (rawPath || '').trim();
-  if (!pathKey) return;
+  if (!pathKey && !rawTitle) return;
   const existing = getInstantCachedDetail(pathKey, rawTitle);
-  if (existing) {
-    warmDetailFirstStream(existing, primeMediaDecoder);
-    return;
-  }
-  // On GitHub Pages, never flood CORS bridges with background detail prefetches;
-  // keep 100% of CORS bridge bandwidth ready for user clicks!
-  const isGhPages =
-    typeof window !== 'undefined' && window.location.hostname.endsWith('github.io');
-  if (isGhPages) return;
-  if (inFlightDetailPromises.has(pathKey)) return;
-
-  const params = new URLSearchParams({ path: pathKey, title: rawTitle, node: nodeId });
-  const p = universalApiFetch(`/api/details?${params.toString()}`)
-    .then((data) => {
-      if (data?.ok && data?.detail) {
-        clientDetailCache.set(pathKey, { detail: data.detail, ts: Date.now() });
-        warmDetailFirstStream(data.detail, primeMediaDecoder);
-      }
-      return data;
-    })
-    .catch(() => null)
-    .finally(() => {
-      inFlightDetailPromises.delete(pathKey);
-    });
-
-  inFlightDetailPromises.set(pathKey, p);
+  if (existing) return;
+  loadShardForMovie(pathKey, rawTitle).catch(() => {});
 }
 
-function scheduleBackgroundCatalogDetailWarmup(items: MovieCardItem[], nodeId: string): void {
-  if (typeof window === 'undefined' || !items?.length) return;
-  loadStaticDb().then(() => {
-    const topCandidates = items.slice(0, 6);
-    topCandidates.forEach((item, idx) => {
-      window.setTimeout(() => {
-        if (isVideoActivelyStarting) return;
-        if (item?.path) {
-          prefetchMovieDetails(item.path, item.title || '', nodeId, idx < 2);
-        }
-      }, 200 + idx * 300);
-    });
-  });
+function scheduleBackgroundCatalogDetailWarmup(_items: MovieCardItem[], _nodeId: string): void {
+  // Intentionally do not fire background HTTP Range requests across catalog cards
+  // so 100% of connection slots and bandwidth stay free for instant page load & video playback!
 }
 
 const NODE_ORIGIN_MAP: Record<string, string> = {
@@ -798,22 +816,52 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
   const isGitHubPages =
     typeof window !== 'undefined' && window.location.hostname.endsWith('github.io');
 
-  // 0. Instant 0ms local memory / static-db / in-flight prefetch check for /api/details before any network fetch!
+  // 0. Instant 0ms local memory / static-db / shard check for /api/details before any network fetch!
   if (pathname === '/api/details' && parsedUrl.searchParams.get('enrich') !== '1') {
     const rawPath = (parsedUrl.searchParams.get('path') || '').trim();
     const rawTitle = (parsedUrl.searchParams.get('title') || '').trim();
-    if (!loadedStaticDb) {
-      await loadStaticDb();
-    }
     const instant = getInstantCachedDetail(rawPath, rawTitle);
     if (instant && instant.episodes && instant.episodes.length > 0) {
       return { ok: true, cached: true, detail: instant };
+    }
+    const shardHit = await loadShardForMovie(rawPath, rawTitle);
+    if (shardHit && shardHit.episodes && shardHit.episodes.length > 0) {
+      return { ok: true, cached: true, detail: shardHit };
     }
     const existingPromise = rawPath ? inFlightDetailPromises.get(rawPath) : undefined;
     if (existingPromise) {
       const joined = await existingPromise;
       if (joined?.ok && joined?.detail) {
         return joined;
+      }
+    }
+  }
+
+  // 0b. Instant 0ms catalog check from pre-loaded static-db.json (for instant category tab switching!)
+  if (pathname === '/api/catalog' && parsedUrl.searchParams.get('refresh') !== '1') {
+    const rawPath = parsedUrl.searchParams.get('path') || '/';
+    const page = Math.max(1, parseInt(parsedUrl.searchParams.get('page') || '1', 10));
+    const search = (parsedUrl.searchParams.get('q') || '').trim();
+    const nodeId = parsedUrl.searchParams.get('node') || 'node-alpha';
+    if (!search && loadedStaticDb?.catalogs) {
+      const cleanBase = rawPath === '/' ? '' : rawPath.replace(/\/+$/, '');
+      const pageKey = page > 1 ? `${cleanBase}/page/${page}` : rawPath;
+      const snap = loadedStaticDb.catalogs[pageKey];
+      if (snap && snap.length > 0) {
+        const sorted =
+          rawPath === '/hot-dhamaka' || rawPath === '/'
+            ? sortItemsByHotAndHype(snap)
+            : rawPath === '/new-uploads' || rawPath === '/new-releases'
+              ? sortItemsByRecentUpload(snap)
+              : normalizeMovieCardList(snap);
+        return {
+          ok: true,
+          cached: true,
+          items: sorted,
+          page,
+          maxPage: 520,
+          activeNodeId: nodeId,
+        };
       }
     }
   }

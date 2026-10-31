@@ -311,11 +311,6 @@ export default function App() {
 
   useEffect(() => {
     fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId);
-    // Also trigger a silent live refresh 800ms later so live upstream 1-min-ago uploads sync immediately
-    const liveSyncTimer = window.setTimeout(() => {
-      fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId, true, true);
-    }, 800);
-    return () => window.clearTimeout(liveSyncTimer);
   }, [currentCategory.path, currentPage, submittedSearch, activeNodeId, fetchCatalog]);
 
   // Automatic Real-Time Background Sync for New Movies & Episodes (Every 30s + App Foreground Wake)
