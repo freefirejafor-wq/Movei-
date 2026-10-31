@@ -34,11 +34,6 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps --no-audit --no-fund
 
-      - name: Refresh Live Cinema Database Snapshot (static-db.json)
-        continue-on-error: true
-        timeout-minutes: 2
-        run: npm run generate-db
-
       - name: Build Production Static Bundle for GitHub Pages
         run: npm run build
 

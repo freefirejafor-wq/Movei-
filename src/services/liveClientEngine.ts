@@ -18,17 +18,11 @@ import { prewarmMkvStreamMeta } from './mkvIosClientRemuxer';
 const MIRROR_ORIGINS = [
   'https://cmyyhb.movielinkbd.at',
   'https://4yer8f.movielinkbd.at',
-  'https://movielinkbd.tv',
-  'https://movielinkbd.one',
 ];
 
 const CORS_BRIDGES = [
   (targetUrl: string) =>
     `https://allorigins.hexlet.app/raw?url=${encodeURIComponent(targetUrl)}`,
-  (targetUrl: string) =>
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
-  (targetUrl: string) =>
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
 ];
 
 interface StaticDbSnapshot {
@@ -51,8 +45,12 @@ export function setVideoStartupPriority(active: boolean): void {
 
 function normalizeLookupTitleKey(rawTitle: string): string {
   return (rawTitle || '')
-    .toLowerCase()
     .replace(/\[.*?\]|\(.*?\)/g, ' ')
+    .replace(
+      /\b(?:S\d+|Season\s*\d+(?:-\d+)?|Ep(?:isode)?\s*\d+(?:-\d+)?|Complete(?:d)?|Added|Full\s*HD|ORG|Hindi|Bangla|Bengali|Dual|Multi|The\s*Movie)\b/gi,
+      ' '
+    )
+    .toLowerCase()
     .replace(/[^a-z0-9\u0980-\u09ff]+/g, '')
     .trim();
 }
@@ -69,6 +67,21 @@ async function loadStaticDb(): Promise<StaticDbSnapshot | null> {
         if (parsed?.details) {
           for (const det of Object.values(parsed.details)) {
             if (det?.title && det.episodes?.length) {
+              // Ensure all downloadUrls inside static-db.json are resolved for direct downloads
+              for (const ep of det.episodes) {
+                for (const src of ep.sources || []) {
+                  if (!src.downloadUrl) {
+                    src.downloadUrl = src.url;
+                  } else if (src.downloadUrl.startsWith('/api/go?t=')) {
+                    src.downloadUrl = resolveDirectDownloadUrl(src.downloadUrl);
+                  }
+                }
+              }
+              for (const btn of det.downloadButtons || []) {
+                if (btn.url && btn.url.startsWith('/api/go?t=')) {
+                  btn.url = resolveDirectDownloadUrl(btn.url);
+                }
+              }
               const k1 = normalizeLookupTitleKey(det.title);
               if (k1) staticDbTitleIndex.set(k1, det);
               const k2 = det.title.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -315,6 +328,11 @@ export function prefetchMovieDetails(
     warmDetailFirstStream(existing, primeMediaDecoder);
     return;
   }
+  // On GitHub Pages, never flood CORS bridges with background detail prefetches;
+  // keep 100% of CORS bridge bandwidth ready for user clicks!
+  const isGhPages =
+    typeof window !== 'undefined' && window.location.hostname.endsWith('github.io');
+  if (isGhPages) return;
   if (inFlightDetailPromises.has(pathKey)) return;
 
   const params = new URLSearchParams({ path: pathKey, title: rawTitle, node: nodeId });
@@ -336,22 +354,24 @@ export function prefetchMovieDetails(
 
 function scheduleBackgroundCatalogDetailWarmup(items: MovieCardItem[], nodeId: string): void {
   if (typeof window === 'undefined' || !items?.length) return;
-  const topCandidates = items.slice(0, 12);
-  topCandidates.forEach((item, idx) => {
-    window.setTimeout(() => {
-      if (isVideoActivelyStarting) return;
-      if (item?.path) {
-        prefetchMovieDetails(item.path, item.title || '', nodeId, idx < 2);
-      }
-    }, 150 + idx * 250);
+  loadStaticDb().then(() => {
+    const topCandidates = items.slice(0, 6);
+    topCandidates.forEach((item, idx) => {
+      window.setTimeout(() => {
+        if (isVideoActivelyStarting) return;
+        if (item?.path) {
+          prefetchMovieDetails(item.path, item.title || '', nodeId, idx < 2);
+        }
+      }, 200 + idx * 300);
+    });
   });
 }
 
 const NODE_ORIGIN_MAP: Record<string, string> = {
   'node-alpha': 'https://cmyyhb.movielinkbd.at',
   'node-beta': 'https://4yer8f.movielinkbd.at',
-  'node-gamma': 'https://movielinkbd.tv',
-  'node-delta': 'https://movielinkbd.one',
+  'node-gamma': 'https://cmyyhb.movielinkbd.at',
+  'node-delta': 'https://4yer8f.movielinkbd.at',
 };
 
 async function fetchMirrorHtmlClientSide(
@@ -376,40 +396,30 @@ async function fetchMirrorHtmlClientSide(
     ...MIRROR_ORIGINS.filter((o) => o !== preferredOrigin),
   ];
 
-  // Race the fastest origin + all 3 CORS bridge combinations in parallel for sub-second response!
-  const candidates: Array<{ url: string; origin: string }> = [];
-  for (const origin of orderedOrigins.slice(0, 2)) {
+  // Try primary origin first without flooding duplicate CORS bridge requests, with a generous 10s timeout for 370KB HTML pages
+  for (const origin of orderedOrigins) {
     const targetUrl = `${origin}${cleanPath}`;
-    for (const makeBridgeUrl of CORS_BRIDGES) {
-      candidates.push({ url: makeBridgeUrl(targetUrl), origin });
+    const url = CORS_BRIDGES[0](targetUrl);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) throw new Error('Bad status');
+      const html = await res.text();
+      if (
+        html &&
+        html.length > 800 &&
+        (html.includes('movie-card') || html.includes('mlbdInlinePlayerData'))
+      ) {
+        return { html, finalOrigin: origin };
+      }
+    } catch {
+      // try backup origin
+    } finally {
+      clearTimeout(timer);
     }
   }
-
-  try {
-    return await Promise.any(
-      candidates.map(async ({ url, origin }) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 4500);
-        try {
-          const res = await fetch(url, { signal: controller.signal });
-          if (!res.ok) throw new Error('Bad status');
-          const html = await res.text();
-          if (
-            !html ||
-            html.length <= 800 ||
-            (!html.includes('movie-card') && !html.includes('mlbdInlinePlayerData'))
-          ) {
-            throw new Error('Invalid HTML payload');
-          }
-          return { html, finalOrigin: origin };
-        } finally {
-          clearTimeout(timer);
-        }
-      })
-    );
-  } catch {
-    throw new Error('Client mirror bridges unreachable');
-  }
+  throw new Error('Client mirror bridges unreachable');
 }
 
 function parseClientCatalogHtml(html: string): { items: MovieCardItem[]; maxPage: number } {
@@ -792,6 +802,9 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
   if (pathname === '/api/details' && parsedUrl.searchParams.get('enrich') !== '1') {
     const rawPath = (parsedUrl.searchParams.get('path') || '').trim();
     const rawTitle = (parsedUrl.searchParams.get('title') || '').trim();
+    if (!loadedStaticDb) {
+      await loadStaticDb();
+    }
     const instant = getInstantCachedDetail(rawPath, rawTitle);
     if (instant && instant.episodes && instant.episodes.length > 0) {
       return { ok: true, cached: true, detail: instant };
@@ -1173,19 +1186,10 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
       // fallback below
     }
 
-    // 4. Ultimate fallback: if target path wasn't found, match closest pre-decrypted stream from staticDb
-    if (staticDb?.details) {
-      const anyDetail = Object.values(staticDb.details)[0];
-      if (anyDetail) {
-        return {
-          ok: true,
-          detail: {
-            ...anyDetail,
-            title: rawTitle || anyDetail.title,
-            url: rawPath || anyDetail.url,
-          },
-        };
-      }
+    // 4. Fallback: check staticDb by fuzzy title words (never return an unrelated movie!)
+    const instantFallback = getInstantCachedDetail(rawPath, rawTitle);
+    if (instantFallback && instantFallback.episodes?.length) {
+      return { ok: true, detail: attachRelatedSeasons(instantFallback) };
     }
 
     return { ok: false, error: 'Unable to load stream metadata' };

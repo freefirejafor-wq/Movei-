@@ -8,8 +8,6 @@ const __dirname = path.dirname(__filename);
 const MIRROR_ORIGINS = [
   'https://cmyyhb.movielinkbd.at',
   'https://4yer8f.movielinkbd.at',
-  'https://movielinkbd.tv',
-  'https://movielinkbd.one',
 ];
 
 const ALL_CATEGORY_PATHS = [
@@ -124,7 +122,7 @@ async function fetchFromMirrors(targetPath) {
   for (const origin of MIRROR_ORIGINS) {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 7000);
+      const timer = setTimeout(() => controller.abort(), 3500);
       const url = `${origin}${cleanPath}`;
       const res = await fetch(url, {
         signal: controller.signal,
@@ -360,7 +358,7 @@ function parseMovieDetail(html, itemPath, origin) {
                       ? `${origin}${rawDlUrl.startsWith('/') ? '' : '/'}${rawDlUrl}`
                       : '';
                   return {
-                    id: String(s.id || `src-${idx}-${s.quality || 720}-${sIdx}`),
+                    id: `s${idx}_${sIdx}`,
                     quality: Number(s.quality) || 720,
                     qualityLabel: s.quality_label || `${s.quality || 720}p`,
                     audio: sanitizeBrandText(String(s.audio || 'Multi Audio')),
@@ -369,10 +367,9 @@ function parseMovieDetail(html, itemPath, origin) {
                       : [sanitizeBrandText(String(s.audio || 'Original'))],
                     provider: `Cloud Stream #${sIdx + 1}`,
                     url: rawStreamUrl,
-                    downloadUrl: fullDlUrl,
+                    downloadUrl: sIdx === 0 ? fullDlUrl : rawStreamUrl,
                     type: String(s.type || 'mkv').toLowerCase(),
                     name: sanitizeBrandText(String(s.name || `${title} - ${s.quality || 720}p`)),
-                    screenshot: s.screenshot || undefined,
                   };
                 })
             : [];
@@ -462,11 +459,20 @@ function parseMovieDetail(html, itemPath, origin) {
 
 async function main() {
   console.log('Generating complete multi-category live cinema database...');
-  const catalogs = {};
+  const outPath = path.join(__dirname, '..', 'public', 'static-db.json');
+  let existingDb = { catalogs: {}, details: {} };
+  try {
+    const rawExisting = await fs.readFile(outPath, 'utf8');
+    existingDb = JSON.parse(rawExisting);
+  } catch {
+    // ignore if missing
+  }
+
+  const catalogs = { ...(existingDb.catalogs || {}) };
   const details = {};
 
-  // Fetch all 42+ categories in fast parallel batches of 10
-  const catBatchSize = 10;
+  // Fetch categories in fast parallel batches of 25
+  const catBatchSize = 25;
   for (let i = 0; i < ALL_CATEGORY_PATHS.length; i += catBatchSize) {
     const batch = ALL_CATEGORY_PATHS.slice(i, i + catBatchSize);
     await Promise.all(
@@ -484,14 +490,29 @@ async function main() {
     );
   }
 
-  // Also fetch Page 2 and Page 3 of Home ('/') so over 350+ latest items are available instantaneously
+  // Also fetch multi-page catalogs so hundreds of additional movies & series are available instantaneously
+  const extraPages = [
+    '/page/2',
+    '/page/3',
+    '/page/4',
+    '/page/5',
+    '/type/series/page/2',
+    '/type/series/page/3',
+    '/type/movies/page/2',
+    '/type/movies/page/3',
+    '/ongoing/page/2',
+    '/language/bangla/page/2',
+    '/anime/page/2',
+    '/drama/page/2',
+    '/southIndian/page/2',
+  ];
   await Promise.all(
-    [2, 3].map(async (pageNum) => {
+    extraPages.map(async (pagePath) => {
       try {
-        const { html } = await fetchFromMirrors(`/page/${pageNum}`);
+        const { html } = await fetchFromMirrors(pagePath);
         const items = parseMovieCards(html);
         if (items.length > 0) {
-          catalogs[`/page/${pageNum}`] = items;
+          catalogs[pagePath] = items;
         }
       } catch {
         // ignore
@@ -528,10 +549,10 @@ async function main() {
     (a, b) => toMinutes(a.timeAgo) - toMinutes(b.timeAgo)
   );
   if (sortedByUpload.length > 0) {
-    catalogs['/new-uploads'] = sortedByUpload.slice(0, 42);
+    catalogs['/new-uploads'] = sortedByUpload.slice(0, 48);
     catalogs['/new-releases'] = sortedByUpload
       .filter((i) => i.title.includes('2026') || i.title.includes('2025'))
-      .slice(0, 42);
+      .slice(0, 48);
     if (Array.isArray(catalogs['/'])) {
       const homeSeen = new Set();
       const mergedHome = [];
@@ -549,56 +570,88 @@ async function main() {
     }
   }
 
-  // Collect unique top movies across all major zones + Top 10 This Week to pre-decrypt their stream URLs
-  const top10ExplicitPaths = [
-    '/series/mKs_2z7wauoxpphvgticrov7me2cnq',
-    '/movie/mKs_ggzk4l33ktk7qiazi4ueeqi5ma',
-    '/series/mKs_xcyjyuznclfoi4rdoo5hc3nxci',
-    '/movie/mKs_w2wmvigomvj4wauldgbgjm767q',
-    '/series/mKs_3bb2hmqqj25r7lsh5guzwzlouy',
-    '/series/mKs_5egv5ywg7yuru7uokk2xarqu3y',
-  ];
-  const uniquePaths = [...top10ExplicitPaths];
-  const seen = new Set(top10ExplicitPaths);
-  const priorityPools = [
-    catalogs['/']?.slice(0, 40) || [],
-    catalogs['/mostwatch/7d']?.slice(0, 12) || [],
-    catalogs['/anime']?.slice(0, 14) || [],
-    catalogs['/ongoing']?.slice(0, 12) || [],
-    catalogs['/drama']?.slice(0, 12) || [],
-    catalogs['/language/bangla']?.slice(0, 14) || [],
-    catalogs['/language/bangla-dubbed']?.slice(0, 10) || [],
-    catalogs['/southIndian']?.slice(0, 12) || [],
-    catalogs['/bollywood']?.slice(0, 12) || [],
-    catalogs['/adult18plus']?.slice(0, 10) || [],
-  ];
+  const normKey = (t) =>
+    String(t || '')
+      .replace(/\[.*?\]|\(.*?\)/g, ' ')
+      .replace(
+        /\b(?:S\d+|Season\s*\d+(?:-\d+)?|Ep(?:isode)?\s*\d+(?:-\d+)?|Complete(?:d)?|Added|Full\s*HD|ORG|Hindi|Bangla|Bengali|Dual|Multi|The\s*Movie)\b/gi,
+        ' '
+      )
+      .toLowerCase()
+      .replace(/[^a-z0-9\u0980-\u09ff]+/g, '')
+      .trim();
 
-  for (const pool of priorityPools) {
-    for (const item of pool) {
-      if (item?.path && !seen.has(item.path)) {
-        seen.add(item.path);
-        uniquePaths.push(item.path);
+  const existingByNormTitle = new Map();
+  for (const det of Object.values(existingDb.details || {})) {
+    if (det?.title && det.episodes?.length) {
+      const k = normKey(det.title);
+      if (k && !existingByNormTitle.has(k)) {
+        existingByNormTitle.set(k, det);
       }
     }
   }
 
   const seenDetailTitles = new Set();
-  const batchSize = 15;
-  for (let i = 0; i < uniquePaths.length; i += batchSize) {
-    const batch = uniquePaths.slice(i, i + batchSize);
+  const compactDetail = (det, itemPath) => {
+    for (const ep of det.episodes || []) {
+      ep.sources = (ep.sources || []).slice(0, 2).map((s, sIdx) => ({
+        id: `s_${sIdx}`,
+        quality: s.quality || 720,
+        qualityLabel: s.qualityLabel || `${s.quality || 720}p`,
+        audio: s.audio || 'Multi Audio',
+        audioLanguages: s.audioLanguages || [],
+        provider: `Cloud Stream #${sIdx + 1}`,
+        url: s.url,
+        downloadUrl: s.url,
+        type: s.type || 'mkv',
+        name: '',
+      }));
+    }
+    det.downloadButtons = (det.downloadButtons || []).slice(0, 3);
+    det.screenshots = (det.screenshots || []).slice(0, 2);
+    det.url = itemPath || det.url;
+    return det;
+  };
+
+  // First, populate from existingDb for all matching catalog items immediately (0ms!)
+  const toFetchPaths = [];
+  const seenPaths = new Set();
+  const seenCandidateKeys = new Set();
+  for (const list of Object.values(catalogs)) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item?.path || seenPaths.has(item.path)) continue;
+      seenPaths.add(item.path);
+      const k = normKey(item.title);
+      const hit = existingDb.details?.[item.path] || (k && existingByNormTitle.get(k));
+      if (hit && hit.episodes?.length) {
+        if (k && !seenDetailTitles.has(k)) {
+          seenDetailTitles.add(k);
+          details[item.path] = compactDetail(JSON.parse(JSON.stringify(hit)), item.path);
+        }
+      } else if (!k || !seenCandidateKeys.has(k)) {
+        if (k) seenCandidateKeys.add(k);
+        toFetchPaths.push(item.path);
+      }
+    }
+  }
+
+  console.log(`Matched ${Object.keys(details).length} cached details; fetching ${toFetchPaths.length} remaining unique titles...`);
+
+  // Fetch ALL remaining unique catalog items in fast parallel batches of 35
+  const batchSize = 35;
+  for (let i = 0; i < toFetchPaths.length; i += batchSize) {
+    const batch = toFetchPaths.slice(i, i + batchSize);
     await Promise.all(
       batch.map(async (itemPath) => {
         try {
           const { html, finalOrigin } = await fetchFromMirrors(itemPath);
           const detail = parseMovieDetail(html, itemPath, finalOrigin);
           if (detail.episodes.length > 0 || detail.downloadButtons.length > 0) {
-            const titleKey = (detail.title || '').toLowerCase().trim();
-            // Avoid storing 5-7 duplicate 135KB objects for the same multi-episode daily series
-            if (detail.episodes.length > 15 && seenDetailTitles.has(titleKey)) {
-              return;
-            }
-            if (titleKey) seenDetailTitles.add(titleKey);
-            details[itemPath] = detail;
+            const k = normKey(detail.title);
+            if (k && seenDetailTitles.has(k)) return;
+            if (k) seenDetailTitles.add(k);
+            details[itemPath] = compactDetail(detail, itemPath);
           }
         } catch {
           // ignore
@@ -607,7 +660,20 @@ async function main() {
     );
   }
 
-  const outPath = path.join(__dirname, '..', 'public', 'static-db.json');
+  // Also preserve any remaining unique existing details
+  for (const [oldPath, oldDet] of Object.entries(existingDb.details || {})) {
+    const k = normKey(oldDet?.title);
+    if (k && !seenDetailTitles.has(k) && oldDet?.episodes?.length) {
+      seenDetailTitles.add(k);
+      details[oldPath] = compactDetail(oldDet, oldPath);
+    }
+  }
+
+  if (Object.keys(details).length < 20 && Object.keys(existingDb.details || {}).length >= 20) {
+    console.log('Keeping existing static-db.json because live mirror was unreachable.');
+    return;
+  }
+
   await fs.writeFile(
     outPath,
     JSON.stringify({
